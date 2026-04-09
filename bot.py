@@ -30,19 +30,34 @@ import asyncio
 import aiohttp
 from datetime import datetime, time
 import pytz
+from pymongo import MongoClient
 
 # ── CONFIG ────────────────────────────────────────────────────────
 TOKEN        = os.getenv("DISCORD_TOKEN")
 GAS_URL      = os.getenv("GAS_URL", "https://script.google.com/macros/s/AKfycbyTadW-WF4vnpaciFv8Qv58ahWSQ7KVmQfxJA75_z5fZN3UEBunnDPAeq_i5jiu35sYjQ/exec")
-ADMIN_ROLE   = os.getenv("ADMIN_ROLE", "Admin")          # Discord role name for admins
-APPROVE_CH   = os.getenv("APPROVE_CHANNEL", "admin-log") # Channel for link approvals
-TIMEZONE     = os.getenv("TIMEZONE", "Asia/Kolkata")      # IST by default
-EOD_HOUR     = int(os.getenv("EOD_HOUR", "23"))           # End-of-day hour (23 = 11 PM)
+ADMIN_ROLE   = os.getenv("ADMIN_ROLE", "Admin")
+APPROVE_CH   = os.getenv("APPROVE_CHANNEL", "admin-log")
+TIMEZONE     = os.getenv("TIMEZONE", "Asia/Kolkata")
+EOD_HOUR     = int(os.getenv("EOD_HOUR", "23"))
 EOD_MINUTE   = int(os.getenv("EOD_MINUTE", "55"))
-DATA_FILE    = "data.json"
+MONGO_URI    = os.getenv("MONGO_URI")  # <-- Add this env var in your host
 
-# ── DATA STRUCTURE ────────────────────────────────────────────────
-# data.json schema:
+# ── MONGODB SETUP ─────────────────────────────────────────────────
+# Connects to MongoDB Atlas (free tier). All persistent data lives there.
+# Falls back to local data.json if MONGO_URI is not set (for local dev).
+
+_mongo_client = None
+_db = None
+
+def get_db():
+    global _mongo_client, _db
+    if MONGO_URI and _db is None:
+        _mongo_client = MongoClient(MONGO_URI)
+        _db = _mongo_client["shadowbot"]
+    return _db
+
+# ── DATA LOAD/SAVE ────────────────────────────────────────────────
+# "data" dict schema (same as before):
 # {
 #   "base_echo_rate": 500,
 #   "links": { "discord_user_id": {"shadow_id": "SS0001", "approved": true} },
@@ -50,22 +65,65 @@ DATA_FILE    = "data.json"
 #   "todos": { "discord_user_id": [ {"task": "...", "done": false}, ... ] },
 #   "members": [ { ...shadowrecord member objects... } ]
 # }
+#
+# With MongoDB:
+#   - links, pending_links, todos, base_echo_rate → stored in MongoDB (persistent)
+#   - members → still synced from GAS (as before)
+
+DATA_FILE = "data.json"
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {
-        "base_echo_rate": 500,
-        "links": {},
-        "pending_links": {},
-        "todos": {},
-        "members": []
-    }
+    db = get_db()
+
+    if db is not None:
+        # Load persistent fields from MongoDB
+        doc = db["config"].find_one({"_id": "main"}) or {}
+        members_doc = db["members"].find_one({"_id": "list"}) or {}
+        return {
+            "base_echo_rate": doc.get("base_echo_rate", 500),
+            "links":          doc.get("links", {}),
+            "pending_links":  doc.get("pending_links", {}),
+            "todos":          doc.get("todos", {}),
+            "members":        members_doc.get("members", []),
+        }
+    else:
+        # Fallback: local file (for local development without MongoDB)
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        return {
+            "base_echo_rate": 500,
+            "links": {},
+            "pending_links": {},
+            "todos": {},
+            "members": []
+        }
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    db = get_db()
+
+    if db is not None:
+        # Save config (links, todos, etc.) to MongoDB
+        db["config"].update_one(
+            {"_id": "main"},
+            {"$set": {
+                "base_echo_rate": data.get("base_echo_rate", 500),
+                "links":          data.get("links", {}),
+                "pending_links":  data.get("pending_links", {}),
+                "todos":          data.get("todos", {}),
+            }},
+            upsert=True
+        )
+        # Save members separately (they're large and synced from GAS)
+        db["members"].update_one(
+            {"_id": "list"},
+            {"$set": {"members": data.get("members", [])}},
+            upsert=True
+        )
+    else:
+        # Fallback: local file
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
 
 # ── BOT SETUP ─────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -163,7 +221,6 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
         todos = data["todos"].get(discord_id, [])
 
         if not todos:
-            # No tasks = 0 echoes today
             earned = 0
             pct = 0
         else:
@@ -172,7 +229,6 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
             pct   = done / total
             earned = round(base * pct)
 
-        # Update echo count in members list
         for i, m in enumerate(data["members"]):
             if m["shadowId"] == shadow_id:
                 old = int(m.get("echoCount", 0))
@@ -188,13 +244,11 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
                 })
                 break
 
-        # Clear todos for next day
         data["todos"][discord_id] = []
 
     save_data(data)
     await push_to_gas(data)
 
-    # Announce in a channel if there's a results channel
     if announce and results:
         ch = discord.utils.get(guild.text_channels, name="echo-log")
         if not ch:
@@ -618,13 +672,17 @@ async def sync_cmd(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"[SHADOW BOT] Logged in as {bot.user} ({bot.user.id})")
+    if MONGO_URI:
+        print("[SHADOW BOT] MongoDB connected — data is persistent ✓")
+    else:
+        print("[SHADOW BOT] WARNING: MONGO_URI not set — using local file (data will reset on redeploy!)")
+
     try:
         synced = await tree.sync()
         print(f"[SHADOW BOT] Synced {len(synced)} slash commands")
     except Exception as e:
         print(f"[SHADOW BOT] Sync error: {e}")
 
-    # Pull initial data from GAS
     data = load_data()
     await pull_from_gas(data)
     print(f"[SHADOW BOT] Loaded {len(load_data()['members'])} members from GAS")
