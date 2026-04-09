@@ -1,24 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         SHADOW BOT · ShadowSeekers Order             ║
-║  Todo tracking + Echo management + GAS sync          ║
+║   Objective tracking · Echo management · GAS sync    ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS (all slash commands):
-  /todo add <task>          — add a task to today's list
-  /todo multiadd <tasks>    — bulk add tasks (comma separated)
-  /todo done <number>       — mark task as complete
-  /todo list                — view your current list
-  /todo clear               — wipe your list (start fresh)
-  /echoes              — see your echo count + tier
-  /leaderboard         — top 10 operatives by echoes
-  /link <shadow_id>    — link your Discord to a Shadow ID
+  /todo add <objective>        — log a new objective
+  /todo multiadd <objectives>  — log multiple objectives at once
+  /todo done <number>          — mark an objective as fulfilled
+  /todo list                   — view your active dossier
+  /todo clear                  — purge your dossier
+  /echoes                      — reveal your echo count + rank
+  /leaderboard                 — top 10 operatives by echo power
+  /link <shadow_id>            — bind your identity to a Shadow ID
 
-ADMIN ONLY:
-  /approve @user       — approve a link request
-  /give @user <amount> — manually award echoes
-  /setbase <number>    — set daily base echo rate (default 500)
-  /forceday            — manually trigger end-of-day calculation
+COMMAND ONLY (HIGH CLEARANCE):
+  /approve @operative  — authorize an identity bind request
+  /give @operative <amount> — manually channel echoes
+  /setbase <number>    — recalibrate the daily echo threshold
+  /forceday            — force the midnight echo reckoning
 """
 
 import discord
@@ -107,7 +107,7 @@ def get_tier(echo_count: int):
 
 def make_embed(title, description="", color=0x7B2FBE):
     e = discord.Embed(title=title, description=description, color=color)
-    e.set_footer(text="SHADOWSEEKERS ORDER · SHADOW BOT")
+    e.set_footer(text="☽ SHADOWSEEKERS ORDER · FROM THE VOID, WE RISE")
     return e
 
 # ── GAS SYNC ──────────────────────────────────────────────────────
@@ -206,14 +206,14 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
                 bar = "█" * bar_filled + "░" * (10 - bar_filled)
                 lines.append(
                     f"`{r['shadow_id']}` **{r['codename']}**\n"
-                    f"`[{bar}]` {r['done']}/{r['total']} tasks · **+{r['earned']} echoes**"
+                    f"`[{bar}]` {r['done']}/{r['total']} objectives · **+{r['earned']} echoes**"
                 )
             embed = make_embed(
-                "◈ DAILY ECHO REPORT",
-                "\n\n".join(lines) or "No activity recorded today.",
+                "☽ NIGHTLY ECHO RECKONING",
+                "\n\n".join(lines) or "The void recorded no activity this cycle.",
                 color=0xF0A500
             )
-            embed.set_footer(text=f"Base rate: {base} · {datetime.now().strftime('%d %b %Y')}")
+            embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · FROM THE VOID, WE RISE · Base resonance: {base} · {datetime.now().strftime('%d %b %Y')}")
             await ch.send(embed=embed)
 
     return results
@@ -229,17 +229,17 @@ async def daily_echo_task():
 # ══════════════════════════════════════════════════════════════════
 
 # ── /todo ─────────────────────────────────────────────────────────
-todo_group = app_commands.Group(name="todo", description="Manage your daily task list")
+todo_group = app_commands.Group(name="todo", description="Manage your operative dossier")
 
-@todo_group.command(name="add", description="Add a task to today's list")
-@app_commands.describe(task="What do you need to do?")
+@todo_group.command(name="add", description="Log a new objective to your dossier")
+@app_commands.describe(task="The objective to be carried out")
 async def todo_add(interaction: discord.Interaction, task: str):
     data = load_data()
     uid  = str(interaction.user.id)
 
     if not get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Use `/link <shadow_id>` first to connect your Discord to your Shadow ID.", color=0xE63946),
+            embed=make_embed("▲ IDENTITY UNBOUND", "Your presence is unverified. Use `/link <shadow_id>` to bind your identity to the Order.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -250,11 +250,11 @@ async def todo_add(interaction: discord.Interaction, task: str):
 
     count = len(data["todos"][uid])
     await interaction.response.send_message(
-        embed=make_embed("◉ TASK ADDED", f"**{interaction.user.display_name}** added task **#{count}**\n\n{task}", color=0x10B981)
+        embed=make_embed("◉ OBJECTIVE LOGGED", f"**{interaction.user.display_name}** has entered the shadows with objective **#{count}**\n\n*{task}*", color=0x10B981)
     )
 
-@todo_group.command(name="done", description="Mark a task as complete")
-@app_commands.describe(number="Task number (from /todo list)")
+@todo_group.command(name="done", description="Mark an objective as fulfilled")
+@app_commands.describe(number="Objective number (from /todo list)")
 async def todo_done(interaction: discord.Interaction, number: int):
     data = load_data()
     uid  = str(interaction.user.id)
@@ -262,7 +262,7 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
     if not todos or number < 1 or number > len(todos):
         await interaction.response.send_message(
-            embed=make_embed("▲ INVALID", f"Task #{number} not found. Use `/todo list` to see your tasks.", color=0xE63946),
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{number} does not exist in your dossier. Use `/todo list` to review your assignments.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -279,15 +279,15 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
     await interaction.response.send_message(
         embed=make_embed(
-            "✓ TASK COMPLETE",
-            f"**{interaction.user.display_name}** completed: **{todos[number-1]['task']}**\n\n"
-            f"`{done}/{total} tasks` · {pct}% complete\n"
-            f"Projected echoes today: **{proj}**",
+            "☽ OBJECTIVE FULFILLED",
+            f"**{interaction.user.display_name}** has completed: *{todos[number-1]['task']}*\n\n"
+            f"`{done}/{total} objectives` · {pct}% of dossier cleared\n"
+            f"Echo resonance projected: **{proj}**",
             color=0x10B981
         )
     )
 
-@todo_group.command(name="list", description="View your current task list")
+@todo_group.command(name="list", description="View your operative dossier")
 async def todo_list(interaction: discord.Interaction):
     data  = load_data()
     uid   = str(interaction.user.id)
@@ -295,13 +295,13 @@ async def todo_list(interaction: discord.Interaction):
 
     if not todos:
         await interaction.response.send_message(
-            embed=make_embed("◈ YOUR TASKS", "No tasks yet. Use `/todo add <task>` to start.", color=0x7B2FBE)
+            embed=make_embed("◈ DOSSIER EMPTY", "No objectives have been assigned. The shadows await your move — use `/todo add` to begin.", color=0x7B2FBE)
         )
         return
 
     lines = []
     for i, t in enumerate(todos, 1):
-        check = "✓" if t["done"] else "○"
+        check = "☽" if t["done"] else "○"
         strike = f"~~{t['task']}~~" if t["done"] else t["task"]
         lines.append(f"`{check}` **{i}.** {strike}")
 
@@ -310,29 +310,29 @@ async def todo_list(interaction: discord.Interaction):
     base  = data.get("base_echo_rate", 500)
     proj  = round(base * done / total) if total else 0
 
-    embed = make_embed(f"◈ {interaction.user.display_name}'s TASKS", "\n".join(lines), color=0xA855F7)
-    embed.add_field(name="Progress", value=f"{done}/{total} done · **{proj} echoes** projected", inline=False)
+    embed = make_embed(f"◈ {interaction.user.display_name}'s DOSSIER", "\n".join(lines), color=0xA855F7)
+    embed.add_field(name="▸ Mission Status", value=f"{done}/{total} fulfilled · **{proj} echoes** resonating", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@todo_group.command(name="clear", description="Clear your task list and start fresh")
+@todo_group.command(name="clear", description="Purge your entire dossier")
 async def todo_clear(interaction: discord.Interaction):
     data = load_data()
     uid  = str(interaction.user.id)
     data["todos"][uid] = []
     save_data(data)
     await interaction.response.send_message(
-        embed=make_embed("◈ LIST CLEARED", f"**{interaction.user.display_name}** wiped their task list. Fresh start.", color=0x6B6B9A)
+        embed=make_embed("◈ DOSSIER PURGED", f"**{interaction.user.display_name}** has erased all traces. The slate is void. A new cycle begins.", color=0x6B6B9A)
     )
 
-@todo_group.command(name="multiadd", description="Bulk add multiple tasks at once (comma separated)")
-@app_commands.describe(tasks="Tasks separated by commas e.g. Task 1, Task 2, Task 3")
+@todo_group.command(name="multiadd", description="Log multiple objectives at once (comma separated)")
+@app_commands.describe(tasks="Objectives separated by commas e.g. Infiltrate base, Secure the relic, Vanish")
 async def todo_multiadd(interaction: discord.Interaction, tasks: str):
     data = load_data()
     uid  = str(interaction.user.id)
 
     if not get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Use `/link <shadow_id>` first to connect your Discord to your Shadow ID.", color=0xE63946),
+            embed=make_embed("▲ IDENTITY UNBOUND", "Your presence is unverified. Use `/link <shadow_id>` to bind your identity to the Order.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -340,7 +340,7 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
     task_list = [t.strip() for t in tasks.split(",") if t.strip()]
     if not task_list:
         await interaction.response.send_message(
-            embed=make_embed("▲ INVALID", "No tasks found. Separate tasks with commas.", color=0xE63946),
+            embed=make_embed("▲ TRANSMISSION FAILED", "No objectives detected. Separate them with commas and try again.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -351,11 +351,11 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
         data["todos"][uid].append({"task": task, "done": False})
     save_data(data)
 
-    lines = [f"**#{start_count + i + 1}** · {t}" for i, t in enumerate(task_list)]
+    lines = [f"**#{start_count + i + 1}** · *{t}*" for i, t in enumerate(task_list)]
     await interaction.response.send_message(
         embed=make_embed(
-            f"◉ {len(task_list)} TASKS ADDED",
-            f"**{interaction.user.display_name}** added:\n\n" + "\n".join(lines),
+            f"◉ {len(task_list)} OBJECTIVES LOGGED",
+            f"**{interaction.user.display_name}** steps deeper into the dark:\n\n" + "\n".join(lines),
             color=0x10B981
         )
     )
@@ -363,7 +363,7 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
 tree.add_command(todo_group)
 
 # ── /echoes ───────────────────────────────────────────────────────
-@tree.command(name="echoes", description="Check your Echo count and tier")
+@tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
 async def echoes(interaction: discord.Interaction):
     data      = load_data()
     uid       = str(interaction.user.id)
@@ -371,20 +371,19 @@ async def echoes(interaction: discord.Interaction):
 
     if not shadow_id:
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Use `/link <shadow_id>` to connect your Discord account.", color=0xE63946),
+            embed=make_embed("▲ IDENTITY UNBOUND", "You exist outside the Order's records. Use `/link <shadow_id>` to bind your identity.", color=0xE63946),
             ephemeral=True
         )
         return
 
     member = get_member(shadow_id, data)
     if not member:
-        # Pull fresh from GAS
         await pull_from_gas(data)
         member = get_member(shadow_id, load_data())
 
     if not member:
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT FOUND", f"Shadow ID `{shadow_id}` not found in records.", color=0xE63946),
+            embed=make_embed("▲ OPERATIVE NOT FOUND", f"Shadow ID `{shadow_id}` has no record in the void.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -396,16 +395,16 @@ async def echoes(interaction: discord.Interaction):
     total = len(todos)
     proj  = round(data.get("base_echo_rate", 500) * done / total) if total else 0
 
-    embed = discord.Embed(title=f"◈ {member['codename']}", color=tier["color"])
-    embed.add_field(name="Shadow ID",   value=f"`{shadow_id}`",              inline=True)
-    embed.add_field(name="Echo Count",  value=f"**{count:,}**",              inline=True)
-    embed.add_field(name="Tier",        value=f"**{tier['name'].upper()}**",  inline=True)
-    embed.add_field(name="Today's Tasks", value=f"{done}/{total} done · +{proj} projected", inline=False)
-    embed.set_footer(text="SHADOWSEEKERS ORDER · SHADOW BOT")
+    embed = discord.Embed(title=f"☽ {member['codename']}", color=tier["color"])
+    embed.add_field(name="Shadow ID",        value=f"`{shadow_id}`",             inline=True)
+    embed.add_field(name="Echo Resonance",   value=f"**{count:,}**",             inline=True)
+    embed.add_field(name="Rank",             value=f"**{tier['name'].upper()}**", inline=True)
+    embed.add_field(name="Today's Dossier",  value=f"{done}/{total} fulfilled · +{proj} resonating", inline=False)
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · FROM THE VOID, WE RISE")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ── /leaderboard ──────────────────────────────────────────────────
-@tree.command(name="leaderboard", description="Top 10 operatives by Echo count")
+@tree.command(name="leaderboard", description="The most powerful operatives in the Order")
 async def leaderboard(interaction: discord.Interaction):
     data = load_data()
     if not data["members"]:
@@ -416,7 +415,7 @@ async def leaderboard(interaction: discord.Interaction):
 
     if not sorted_m:
         await interaction.response.send_message(
-            embed=make_embed("▲ NO DATA", "No members found. Sync with GAS first.", color=0xE63946),
+            embed=make_embed("▲ THE VOID IS SILENT", "No operatives found in the records. Sync with the shadow archive first.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -429,74 +428,69 @@ async def leaderboard(interaction: discord.Interaction):
         rank  = medals[i] if i < 3 else f"`#{i+1}`"
         lines.append(f"{rank} **{m['codename']}** · `{m['shadowId']}` · **{count:,}** _{tier['name']}_")
 
-    embed = make_embed("◈ ECHO LEADERBOARD", "\n".join(lines), color=0xF0A500)
-    embed.set_footer(text=f"SHADOWSEEKERS ORDER · {len(data['members'])} operatives total")
+    embed = make_embed("☽ ECHO DOMINANCE · TOP OPERATIVES", "\n".join(lines), color=0xF0A500)
+    embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · FROM THE VOID, WE RISE · {len(data['members'])} operatives in the dark")
     await interaction.response.send_message(embed=embed)
 
 # ── /link ─────────────────────────────────────────────────────────
-@tree.command(name="link", description="Link your Discord account to your Shadow ID")
+@tree.command(name="link", description="Bind your Discord identity to your Shadow ID")
 @app_commands.describe(shadow_id="Your Shadow ID (e.g. SS0069)")
 async def link(interaction: discord.Interaction, shadow_id: str):
     data     = load_data()
     uid      = str(interaction.user.id)
     sid      = shadow_id.upper().strip()
 
-    # Already linked
     if get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ ALREADY LINKED", f"You're already linked to `{data['links'][uid]['shadow_id']}`.", color=0xE63946),
+            embed=make_embed("▲ ALREADY BOUND", f"Your identity is already bound to `{data['links'][uid]['shadow_id']}`. You walk in the shadows.", color=0xE63946),
             ephemeral=True
         )
         return
 
-    # Check shadow_id format
     import re
     if not re.match(r'^SS\d{4}$', sid):
         await interaction.response.send_message(
-            embed=make_embed("▲ INVALID ID", "Format must be `SS####` e.g. `SS0069`", color=0xE63946),
+            embed=make_embed("▲ INVALID SHADOW ID", "The format must be `SS####` — e.g. `SS0069`. Check your credentials.", color=0xE63946),
             ephemeral=True
         )
         return
 
-    # Check if shadow_id already claimed
     for existing_link in data["links"].values():
         if existing_link["shadow_id"] == sid and existing_link.get("approved"):
             await interaction.response.send_message(
-                embed=make_embed("▲ ALREADY CLAIMED", f"`{sid}` is already linked to another account.", color=0xE63946),
+                embed=make_embed("▲ IDENTITY CLAIMED", f"`{sid}` is already bound to another operative. Contact the Order if this is an error.", color=0xE63946),
                 ephemeral=True
             )
             return
 
-    # Store pending link
     data["pending_links"][uid] = sid
     save_data(data)
 
-    # Notify admin channel
     ch = discord.utils.get(interaction.guild.text_channels, name=APPROVE_CH)
     if ch:
         embed = make_embed(
-            "◈ LINK REQUEST",
-            f"{interaction.user.mention} wants to link to `{sid}`\n\n"
-            f"Use `/approve {interaction.user.id}` to approve.",
+            "◈ IDENTITY BIND REQUEST",
+            f"{interaction.user.mention} seeks to bind to `{sid}`\n\n"
+            f"Use `/approve {interaction.user.id}` to authorize.",
             color=0xF0A500
         )
         await ch.send(embed=embed)
 
     await interaction.response.send_message(
         embed=make_embed(
-            "◈ LINK REQUESTED",
-            f"Your request to link `{sid}` has been sent to admins for approval.\nYou'll be notified once approved.",
+            "◈ REQUEST TRANSMITTED",
+            f"Your request to bind `{sid}` has been sent into the void.\nAwait authorization from the Order.",
             color=0xA855F7
         ),
         ephemeral=True
     )
 
 # ── /approve ──────────────────────────────────────────────────────
-@tree.command(name="approve", description="[ADMIN] Approve a member's link request")
-@app_commands.describe(user="The Discord user to approve")
+@tree.command(name="approve", description="[HIGH CLEARANCE] Authorize an operative's identity bind")
+@app_commands.describe(user="The operative to authorize")
 async def approve(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction):
-        await interaction.response.send_message(embed=make_embed("▲ ACCESS DENIED", "Admins only.", color=0xE63946), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
 
     data = load_data()
@@ -505,7 +499,7 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
 
     if not sid:
         await interaction.response.send_message(
-            embed=make_embed("▲ NO PENDING REQUEST", f"{user.display_name} has no pending link request.", color=0xE63946),
+            embed=make_embed("▲ NO PENDING REQUEST", f"**{user.display_name}** has no pending bind request in the void.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -514,27 +508,26 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
     del data["pending_links"][uid]
     save_data(data)
 
-    # DM the user
     try:
         await user.send(embed=make_embed(
-            "◈ LINK APPROVED",
-            f"Your Discord has been linked to `{sid}`.\nYou can now use `/todo` and `/echoes`.",
+            "☽ IDENTITY AUTHORIZED",
+            f"The Order has spoken. Your identity is now bound to `{sid}`.\nStep into the shadows — use `/todo` and `/echoes`.",
             color=0x10B981
         ))
     except:
         pass
 
     await interaction.response.send_message(
-        embed=make_embed("◉ APPROVED", f"{user.display_name} linked to `{sid}`.", color=0x10B981),
+        embed=make_embed("◉ OPERATIVE AUTHORIZED", f"**{user.display_name}** is now bound to `{sid}`. They walk among us.", color=0x10B981),
         ephemeral=True
     )
 
 # ── /give ─────────────────────────────────────────────────────────
-@tree.command(name="give", description="[ADMIN] Manually award echoes to an operative")
-@app_commands.describe(user="Discord user to award", amount="Echo amount (can be negative)")
+@tree.command(name="give", description="[HIGH CLEARANCE] Channel echoes to an operative")
+@app_commands.describe(user="The operative to channel echoes to", amount="Echo amount (can be negative)")
 async def give(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_admin(interaction):
-        await interaction.response.send_message(embed=make_embed("▲ ACCESS DENIED", "Admins only.", color=0xE63946), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
 
     data      = load_data()
@@ -543,7 +536,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
 
     if not shadow_id:
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", f"{user.display_name} has no linked Shadow ID.", color=0xE63946),
+            embed=make_embed("▲ OPERATIVE UNBOUND", f"**{user.display_name}** has no bound Shadow ID.", color=0xE63946),
             ephemeral=True
         )
         return
@@ -558,66 +551,66 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
             sign = "+" if amount >= 0 else ""
             await interaction.response.send_message(
                 embed=make_embed(
-                    "◉ ECHOES AWARDED",
-                    f"**{m['codename']}** (`{shadow_id}`)\n`{old:,}` → **{new:,}** ({sign}{amount:,})",
+                    "◉ ECHOES CHANNELED",
+                    f"**{m['codename']}** (`{shadow_id}`)\n`{old:,}` → **{new:,}** ({sign}{amount:,})\nThe void has been adjusted.",
                     color=0x10B981
                 )
             )
             return
 
-    await interaction.response.send_message(embed=make_embed("▲ NOT FOUND", "Member not in records.", color=0xE63946), ephemeral=True)
+    await interaction.response.send_message(embed=make_embed("▲ OPERATIVE NOT FOUND", "No record found in the shadow archive.", color=0xE63946), ephemeral=True)
 
 # ── /setbase ──────────────────────────────────────────────────────
-@tree.command(name="setbase", description="[ADMIN] Set the daily base echo rate")
-@app_commands.describe(amount="Base echoes per day for 100% completion")
+@tree.command(name="setbase", description="[HIGH CLEARANCE] Recalibrate the daily echo resonance threshold")
+@app_commands.describe(amount="Base echoes per cycle for full dossier completion")
 async def setbase(interaction: discord.Interaction, amount: int):
     if not is_admin(interaction):
-        await interaction.response.send_message(embed=make_embed("▲ ACCESS DENIED", "Admins only.", color=0xE63946), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
     data = load_data()
     data["base_echo_rate"] = max(1, amount)
     save_data(data)
     await interaction.response.send_message(
-        embed=make_embed("◉ BASE RATE SET", f"Daily base echo rate is now **{amount:,}** echoes.", color=0x10B981)
+        embed=make_embed("◉ RESONANCE RECALIBRATED", f"The daily echo threshold has been set to **{amount:,}**. The Order adjusts.", color=0x10B981)
     )
 
 # ── /forceday ─────────────────────────────────────────────────────
-@tree.command(name="forceday", description="[ADMIN] Manually trigger end-of-day echo calculation")
+@tree.command(name="forceday", description="[HIGH CLEARANCE] Force the midnight echo reckoning")
 async def forceday(interaction: discord.Interaction):
     if not is_admin(interaction):
-        await interaction.response.send_message(embed=make_embed("▲ ACCESS DENIED", "Admins only.", color=0xE63946), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
     await interaction.response.send_message(
-        embed=make_embed("◉ RUNNING EOD", "Calculating echoes for all operatives...", color=0xA855F7)
+        embed=make_embed("◉ RECKONING INITIATED", "The void stirs... calculating echo resonance for all operatives.", color=0xA855F7)
     )
     results = await run_end_of_day(interaction.guild)
     total_given = sum(r["earned"] for r in results)
     await interaction.followup.send(
         embed=make_embed(
-            "◉ EOD COMPLETE",
-            f"Processed **{len(results)}** operatives · **{total_given:,}** echoes awarded · Synced to sheet.",
+            "☽ RECKONING COMPLETE",
+            f"**{len(results)}** operatives assessed · **{total_given:,}** echoes dispersed into the dark · Archive synced.",
             color=0x10B981
         )
     )
 
 # ── /sync ─────────────────────────────────────────────────────────
-@tree.command(name="sync", description="[ADMIN] Pull latest member data from Google Sheet")
+@tree.command(name="sync", description="[HIGH CLEARANCE] Pull the latest operative data from the shadow archive")
 async def sync_cmd(interaction: discord.Interaction):
     if not is_admin(interaction):
-        await interaction.response.send_message(embed=make_embed("▲ ACCESS DENIED", "Admins only.", color=0xE63946), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
-    await interaction.response.send_message(embed=make_embed("◉ SYNCING", "Pulling from GAS sheet...", color=0xA855F7), ephemeral=True)
+    await interaction.response.send_message(embed=make_embed("◉ REACHING INTO THE VOID", "Pulling data from the shadow archive...", color=0xA855F7), ephemeral=True)
     data = load_data()
     ok   = await pull_from_gas(data)
     data = load_data()
     if ok:
         await interaction.followup.send(
-            embed=make_embed("◉ SYNCED", f"Pulled **{len(data['members'])}** operatives from sheet.", color=0x10B981),
+            embed=make_embed("◉ ARCHIVE SYNCED", f"**{len(data['members'])}** operatives recalled from the shadows.", color=0x10B981),
             ephemeral=True
         )
     else:
         await interaction.followup.send(
-            embed=make_embed("▲ SYNC FAILED", "Could not reach GAS. Check URL and deployment.", color=0xE63946),
+            embed=make_embed("▲ TRANSMISSION LOST", "Could not reach the shadow archive. Verify the GAS URL and deployment.", color=0xE63946),
             ephemeral=True
         )
 
