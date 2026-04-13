@@ -178,26 +178,12 @@ ECHO_TIERS = [
 ]
 
 
-PRIORITY_COLORS = {
-    "p1": "🔴",   # red circle — label only, text color via markdown
-    "p2": "🟠",   # orange
-    "p3": "🟡",   # yellow
+# Priority emoji suffixes — shown at end of task text
+PRIORITY_EMOJI = {
+    "p1": "🔺",   # 🔺 red triangle
+    "p2": "🟧",   # 🟧 orange square
+    "p3": "🔸",   # 🔸 small orange diamond
 }
-
-# Discord ANSI color codes for embed code blocks
-PRIORITY_ANSI = {
-    "p1": "[31m",   # red
-    "p2": "[33m",   # orange (closest in ANSI)
-    "p3": "[33m",   # yellow — we use bright yellow below
-}
-
-# We'll use markdown bold + colored text via ANSI in a code block
-PRIORITY_TEXT_COLOR = {
-    "p1": "\u001b[0;31m",   # red
-    "p2": "\u001b[0;33m",   # dark yellow (appears orange in Discord)
-    "p3": "\u001b[1;33m",   # bright yellow
-}
-RESET_COLOR = "\u001b[0m"
 
 def get_tier(echo_count: int):
     tier = ECHO_TIERS[0]
@@ -501,16 +487,14 @@ async def todo_list(interaction: discord.Interaction):
         )
         return
 
-    # Build ANSI colored list — Discord renders colors in ```ansi blocks
-    ansi_lines = []
+    lines = []
     for i, t in enumerate(todos, 1):
         priority = t.get("priority")
-        color    = PRIORITY_TEXT_COLOR.get(priority, "") if priority else ""
-        reset    = RESET_COLOR if priority else ""
+        suffix   = f" {PRIORITY_EMOJI[priority]}" if priority else ""
         if t["done"]:
-            ansi_lines.append(f"🟢 {color}~~☽ {i}. {t['task']}~~{reset}")
+            lines.append(f"🟢 ~~☽ {i}. {t['task']}~~{suffix}")
         else:
-            ansi_lines.append(f"○ {color}{i}. {t['task']}{reset}")
+            lines.append(f"○ {i}. {t['task']}{suffix}")
 
     done  = sum(1 for t in todos if t["done"])
     total = len(todos)
@@ -520,8 +504,7 @@ async def todo_list(interaction: discord.Interaction):
     is_today   = active == today_str()
     title_date = "TODAY'S" if is_today else active
 
-    ansi_block = "```ansi\n" + "\n".join(ansi_lines) + "\n```"
-    embed = make_embed(f"◈ {interaction.user.display_name}'s {title_date} OBJECTIVES", ansi_block, color=0xA855F7)
+    embed = make_embed(f"◈ {interaction.user.display_name}'s {title_date} OBJECTIVES", "\n".join(lines), color=0xA855F7)
     embed.add_field(name="Progress", value=f"{done}/{total} done · **{proj} echoes** on track", inline=False)
     await interaction.response.send_message(embed=embed)
 
