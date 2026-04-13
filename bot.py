@@ -800,8 +800,8 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
             new = max(0, old + amount)
             data["members"][i]["echoCount"] = new
             await save_data(data)
-            await push_to_gas(data)
             sign = "+" if amount >= 0 else ""
+            # Respond first — GAS push can take seconds and Discord times out at 3s
             await interaction.response.send_message(
                 embed=make_embed(
                     "◉ ECHOES CHANNELED",
@@ -809,6 +809,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
                     color=0x10B981
                 )
             )
+            asyncio.create_task(push_to_gas(data))
             return
 
     await interaction.response.send_message(embed=make_embed("▲ OPERATIVE NOT FOUND", "No record found. Check the Shadow ID.", color=0xE63946))
