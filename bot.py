@@ -7,13 +7,14 @@
 COMMANDS (all slash commands):
   /todo add <objective>        — log a new objective
   /todo multiadd <objectives>  — log multiple objectives at once
-  /todo done <number>          — mark an objective as fulfilled
+  /todo done <number(s)>       — mark objective(s) as fulfilled (comma-separated)
   /todo remove <number>        — remove an objective from your dossier
   /todo list                   — view your active dossier
   /todo clear                  — purge your dossier
   /todo date <MM/DD>           — switch active date (default: today)
   /op add <obj#> <op>          — add an op under an objective
-  /op done <obj#> <op#>        — complete an op under an objective
+  /op multiadd <obj#> <ops>    — add multiple ops (comma-separated)
+  /op done <obj#> <op#s>       — complete op(s) under an objective (comma-separated)
   /op remove <obj#> <op#>      — remove an op from an objective
   /op move <obj#s> <target#>   — convert objectives into ops under target
   /echoes                      — reveal your echo count + rank
@@ -449,28 +450,40 @@ async def todo_add(interaction: discord.Interaction, task: str):
         )
     )
 
-@todo_group.command(name="done", description="Mark an objective as fulfilled")
-@app_commands.describe(number="Objective number (from /todo list)")
-async def todo_done(interaction: discord.Interaction, number: int):
+@todo_group.command(name="done", description="Mark objectives as fulfilled — single or comma-separated e.g. 1,3,5")
+@app_commands.describe(numbers="Objective number(s), comma-separated e.g. 1,3,5")
+async def todo_done(interaction: discord.Interaction, numbers: str):
     data   = await load_data()
     uid    = str(interaction.user.id)
     active = get_active_date(uid, data)
     todos  = get_todos_for_date(uid, active, data)
 
-    if not todos or number < 1 or number > len(todos):
+    try:
+        indices = sorted(set(int(n.strip()) for n in numbers.split(",") if n.strip()))
+    except ValueError:
         await interaction.response.send_message(
-            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{number} doesn't exist. Check `/todo list`.", color=0xE63946),
+            embed=make_embed("▲ INVALID INPUT", "Provide number(s) separated by commas e.g. `1,3,5`.", color=0xE63946)
         )
         return
 
-    todos[number - 1]["done"] = True
+    invalid = [n for n in indices if n < 1 or n > len(todos)]
+    if not todos or invalid:
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective(s) {', '.join(f'#{n}' for n in invalid)} don't exist. Check `/todo list`.", color=0xE63946),
+        )
+        return
+
+    completed = []
+    for n in indices:
+        todos[n - 1]["done"] = True
+        completed.append(todos[n - 1]["task"])
+
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
 
     # Echo projection with ops-aware weighting
     total = len(todos)
     done_weight = 0.0
-    done_count  = 0
     for t in todos:
         ops = t.get("ops", [])
         if ops:
@@ -479,7 +492,6 @@ async def todo_done(interaction: discord.Interaction, number: int):
         else:
             if t["done"]:
                 done_weight += 1
-                done_count  += 1
     done  = sum(1 for t in todos if t["done"])
     pct   = round((done_weight / total) * 100) if total else 0
     base  = data.get("base_echo_rate", 500)
@@ -487,11 +499,13 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
     is_today  = active == today_str()
     date_note = "" if is_today else f" *(session: {active})*"
+    task_lines = "\n".join(f"*{task}*" for task in completed)
+    title = "☽ OBJECTIVE FULFILLED" if len(completed) == 1 else f"☽ {len(completed)} OBJECTIVES FULFILLED"
 
     await interaction.response.send_message(
         embed=make_embed(
-            "☽ OBJECTIVE FULFILLED",
-            f"**{interaction.user.display_name}** completed: *{todos[number-1]['task']}*{date_note}\n\n"
+            title,
+            f"**{interaction.user.display_name}** completed:{date_note}\n{task_lines}\n\n"
             f"`{done}/{total} objectives` · {pct}% complete\n"
             f"Projected echoes: **{proj}**",
             color=0x10B981
@@ -728,9 +742,9 @@ async def op_add(interaction: discord.Interaction, objective: int, op: str):
         )
     )
 
-@op_group.command(name="done", description="Mark an op as complete under an objective")
-@app_commands.describe(objective="Objective number", op="Op number under that objective")
-async def op_done(interaction: discord.Interaction, objective: int, op: int):
+@op_group.command(name="done", description="Mark ops as complete — single or comma-separated e.g. 1,2")
+@app_commands.describe(objective="Objective number", ops="Op number(s), comma-separated e.g. 1,2")
+async def op_done(interaction: discord.Interaction, objective: int, ops: str):
     data   = await load_data()
     uid    = str(interaction.user.id)
     active = get_active_date(uid, data)
@@ -742,25 +756,35 @@ async def op_done(interaction: discord.Interaction, objective: int, op: int):
         )
         return
 
-    t   = todos[objective - 1]
-    ops = t.get("ops", [])
+    t      = todos[objective - 1]
+    op_list = t.get("ops", [])
 
-    if not ops or op < 1 or op > len(ops):
+    try:
+        indices = sorted(set(int(n.strip()) for n in ops.split(",") if n.strip()))
+    except ValueError:
         await interaction.response.send_message(
-            embed=make_embed("▲ OP NOT FOUND", f"Op #{op} doesn't exist under Objective #{objective}.", color=0xE63946)
+            embed=make_embed("▲ INVALID INPUT", "Provide op number(s) separated by commas e.g. `1,2`.", color=0xE63946)
         )
         return
 
-    ops[op - 1]["done"] = True
+    invalid = [n for n in indices if n < 1 or n > len(op_list)]
+    if not op_list or invalid:
+        await interaction.response.send_message(
+            embed=make_embed("▲ OP NOT FOUND", f"Op(s) {', '.join(f'#{n}' for n in invalid)} don't exist under Objective #{objective}.", color=0xE63946)
+        )
+        return
+
+    for n in indices:
+        op_list[n - 1]["done"] = True
 
     # Auto-complete objective if all ops done
-    if all(o["done"] for o in ops):
+    if all(o["done"] for o in op_list):
         t["done"] = True
 
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
 
-    done_ops  = sum(1 for o in ops if o["done"])
+    done_ops  = sum(1 for o in op_list if o["done"])
     obj_label = t["task"]
     auto_note = "\n\n✅ All ops complete — **objective auto-fulfilled.**" if t["done"] else ""
 
@@ -775,10 +799,50 @@ async def op_done(interaction: discord.Interaction, objective: int, op: int):
             done_weight += 1
     proj = round(data.get("base_echo_rate", 500) * done_weight / total_weight) if total_weight else 0
 
+    title = "☽ OP COMPLETE" if len(indices) == 1 else f"☽ {len(indices)} OPS COMPLETE"
     await interaction.response.send_message(
         embed=make_embed(
-            "☽ OP COMPLETE",
-            f"Op **#{op}** under *{obj_label}* fulfilled.\n`{done_ops}/{len(ops)} ops done`{auto_note}\n\nProjected echoes: **{proj}**",
+            title,
+            f"Op(s) **{', '.join(f'#{n}' for n in indices)}** under *{obj_label}* fulfilled.\n`{done_ops}/{len(op_list)} ops done`{auto_note}\n\nProjected echoes: **{proj}**",
+            color=0x10B981
+        )
+    )
+
+@op_group.command(name="multiadd", description="Add multiple ops under an objective (comma-separated)")
+@app_commands.describe(objective="Objective number", ops="Ops separated by commas e.g. Disable cameras, Find the vault")
+async def op_multiadd(interaction: discord.Interaction, objective: int, ops: str):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos or objective < 1 or objective > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{objective} doesn't exist. Check `/todo list`.", color=0xE63946)
+        )
+        return
+
+    op_list = [o.strip() for o in ops.split(",") if o.strip()]
+    if not op_list:
+        await interaction.response.send_message(
+            embed=make_embed("▲ NOTHING TO ADD", "No ops found. Separate them with commas.", color=0xE63946)
+        )
+        return
+
+    t = todos[objective - 1]
+    if "ops" not in t:
+        t["ops"] = []
+    start = len(t["ops"])
+    for o in op_list:
+        t["ops"].append({"task": o, "done": False})
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    lines = "\n".join(f"    └ ○ *{o}*" for o in op_list)
+    await interaction.response.send_message(
+        embed=make_embed(
+            f"◉ {len(op_list)} OPS ADDED",
+            f"Under Objective **#{objective}** · *{t['task']}*\n\n{lines}",
             color=0x10B981
         )
     )
