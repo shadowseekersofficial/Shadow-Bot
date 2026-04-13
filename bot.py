@@ -866,6 +866,24 @@ async def sync_cmd(interaction: discord.Interaction):
         )
 
 # ── /syncids ──────────────────────────────────────────────────────
+async def bulk_syncids_on_gas(members: list) -> dict:
+    """Send all missing members to GAS in a single syncids POST."""
+    try:
+        payload = json.dumps({"action": "syncids", "members": members})
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                GAS_URL,
+                data=payload,
+                headers={"Content-Type": "text/plain"}
+            ) as resp:
+                text = await resp.text()
+                print(f"[GAS SYNCIDS] Status: {resp.status} | Response: {text[:300]}")
+                result = json.loads(text)
+                return result if isinstance(result, dict) else {}
+    except Exception as e:
+        print(f"[GAS SYNCIDS ERROR] {e}")
+    return {}
+
 @tree.command(name="syncids", description="[HIGH CLEARANCE] Create website records for all approved Discord-linked IDs")
 async def syncids(interaction: discord.Interaction):
     if not is_admin(interaction):
@@ -880,44 +898,52 @@ async def syncids(interaction: discord.Interaction):
 
     data = await load_data()
 
-    # Pull current website members so we can skip already-existing ones
-    await pull_from_gas(data)
-    data = await load_data()
-    existing_ids = {m["shadowId"] for m in data["members"]}
+    # Build a quick lookup of existing member echo data from local cache
+    member_cache = {m["shadowId"]: m for m in data["members"]}
 
-    created   = []
-    skipped   = []
-    failed    = []
+    # Build list of all approved members to send to GAS
+    # GAS will handle duplicate detection itself (skips existing shadowIds)
+    to_sync     = []
+    id_to_label = {}  # shadowId -> display label for the result embed
 
     for discord_id, link in data["links"].items():
         if not link.get("approved"):
             continue
-
         sid      = link["shadow_id"]
         codename = link.get("codename", f"Operative {sid}")
-
-        if sid in existing_ids:
-            skipped.append(sid)
-            continue
-
-        new_member = {
+        # Use real echoCount from local cache — NOT hardcoded 0
+        cached   = member_cache.get(sid, {})
+        to_sync.append({
             "shadowId":  sid,
             "codename":  codename,
             "discordId": discord_id,
-            "echoCount": 0,
-        }
+            "echoCount": int(cached.get("echoCount", 0)),
+        })
+        id_to_label[sid] = f"`{sid}` **{codename}**"
 
-        ok = await create_member_on_gas(new_member)
+    if not to_sync:
+        await interaction.followup.send(
+            embed=make_embed("◈ NOTHING TO SYNC", "No approved links found.", color=0x6B6B9A)
+        )
+        return
 
-        if ok:
-            # Also add to local members cache
-            if not any(m["shadowId"] == sid for m in data["members"]):
-                data["members"].append(new_member)
-            created.append(f"`{sid}` **{codename}**")
-        else:
-            failed.append(f"`{sid}` **{codename}**")
+    gas_result = await bulk_syncids_on_gas(to_sync)
 
+    # Add newly created members to local cache
+    gas_created = gas_result.get("created", [])
+    for m in to_sync:
+        if m["shadowId"] in gas_created:
+            if not any(x["shadowId"] == m["shadowId"] for x in data["members"]):
+                data["members"].append(m)
     await save_data(data)
+
+    # Always push latest echo counts for ALL members to GAS sheet
+    # This ensures existing members whose echoes were updated by /todo also get synced
+    await push_to_gas(data)
+
+    created = [id_to_label.get(sid, f"`{sid}`") for sid in gas_result.get("created", [])]
+    skipped = gas_result.get("skipped", [])
+    failed  = [id_to_label.get(sid, f"`{sid}`") for sid in gas_result.get("failed",  [])]
 
     lines = []
     if created:
@@ -929,10 +955,12 @@ async def syncids(interaction: discord.Interaction):
     if not lines:
         lines.append("No approved links found to process.")
 
+    total_echoes = sum(m["echoCount"] for m in to_sync)
+
     await interaction.followup.send(
         embed=make_embed(
             "☽ ID SYNC COMPLETE",
-            "\n\n".join(lines),
+            "\n\n".join(lines) + f"\n\n*Echo counts pushed for all {len(data['members'])} operatives · {total_echoes:,} total echoes on record.*",
             color=0x10B981 if not failed else 0xF0A500
         )
     )
