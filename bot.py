@@ -177,6 +177,28 @@ ECHO_TIERS = [
     {"name": "Voidborn",  "min": 5000, "color": 0xF0A500},
 ]
 
+
+PRIORITY_COLORS = {
+    "p1": "🔴",   # red circle — label only, text color via markdown
+    "p2": "🟠",   # orange
+    "p3": "🟡",   # yellow
+}
+
+# Discord ANSI color codes for embed code blocks
+PRIORITY_ANSI = {
+    "p1": "[31m",   # red
+    "p2": "[33m",   # orange (closest in ANSI)
+    "p3": "[33m",   # yellow — we use bright yellow below
+}
+
+# We'll use markdown bold + colored text via ANSI in a code block
+PRIORITY_TEXT_COLOR = {
+    "p1": "\u001b[0;31m",   # red
+    "p2": "\u001b[0;33m",   # dark yellow (appears orange in Discord)
+    "p3": "\u001b[1;33m",   # bright yellow
+}
+RESET_COLOR = "\u001b[0m"
+
 def get_tier(echo_count: int):
     tier = ECHO_TIERS[0]
     for t in ECHO_TIERS:
@@ -412,7 +434,7 @@ async def todo_add(interaction: discord.Interaction, task: str):
 
     active    = get_active_date(uid, data)
     todos     = get_todos_for_date(uid, active, data)
-    todos.append({"task": task, "done": False})
+    todos.append({"task": task, "done": False, "priority": None})
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
 
@@ -479,11 +501,16 @@ async def todo_list(interaction: discord.Interaction):
         )
         return
 
-    lines = []
+    # Build ANSI colored list — Discord renders colors in ```ansi blocks
+    ansi_lines = []
     for i, t in enumerate(todos, 1):
-        check  = "☽" if t["done"] else "○"
-        strike = f"~~{t['task']}~~" if t["done"] else t["task"]
-        lines.append(f"`{check}` **{i}.** {strike}")
+        priority = t.get("priority")
+        color    = PRIORITY_TEXT_COLOR.get(priority, "") if priority else ""
+        reset    = RESET_COLOR if priority else ""
+        if t["done"]:
+            ansi_lines.append(f"🟢 {color}~~☽ {i}. {t['task']}~~{reset}")
+        else:
+            ansi_lines.append(f"○ {color}{i}. {t['task']}{reset}")
 
     done  = sum(1 for t in todos if t["done"])
     total = len(todos)
@@ -493,7 +520,8 @@ async def todo_list(interaction: discord.Interaction):
     is_today   = active == today_str()
     title_date = "TODAY'S" if is_today else active
 
-    embed = make_embed(f"◈ {interaction.user.display_name}'s {title_date} OBJECTIVES", "\n".join(lines), color=0xA855F7)
+    ansi_block = "```ansi\n" + "\n".join(ansi_lines) + "\n```"
+    embed = make_embed(f"◈ {interaction.user.display_name}'s {title_date} OBJECTIVES", ansi_block, color=0xA855F7)
     embed.add_field(name="Progress", value=f"{done}/{total} done · **{proj} echoes** on track", inline=False)
     await interaction.response.send_message(embed=embed)
 
@@ -562,7 +590,7 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
     todos       = get_todos_for_date(uid, active, data)
     start_count = len(todos)
     for task in task_list:
-        todos.append({"task": task, "done": False})
+        todos.append({"task": task, "done": False, "priority": None})
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
 
@@ -575,6 +603,66 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
             f"◉ {len(task_list)} OBJECTIVES ADDED",
             f"**{interaction.user.display_name}** added to the list{date_note}:\n\n" + "\n".join(lines),
             color=0x10B981
+        )
+    )
+
+
+@todo_group.command(name="priority", description="Set priority on existing objectives (P1=critical, P2=important, P3=normal)")
+@app_commands.describe(
+    level="Priority level: p1, p2, p3, or none to clear",
+    numbers="Task numbers to set, comma separated e.g. 1,3,5"
+)
+async def todo_priority(interaction: discord.Interaction, level: str, numbers: str):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos:
+        await interaction.response.send_message(
+            embed=make_embed("\u25b2 DOSSIER EMPTY", "No objectives to prioritize. Add some with `/todo add`.", color=0xE63946)
+        )
+        return
+
+    lvl = level.lower().strip()
+    if lvl not in ("p1", "p2", "p3", "none"):
+        await interaction.response.send_message(
+            embed=make_embed("\u25b2 INVALID PRIORITY", "Use `p1`, `p2`, `p3`, or `none` to clear.", color=0xE63946)
+        )
+        return
+
+    priority_val = None if lvl == "none" else lvl
+
+    # Parse numbers
+    try:
+        indices = [int(n.strip()) for n in numbers.split(",") if n.strip()]
+    except ValueError:
+        await interaction.response.send_message(
+            embed=make_embed("\u25b2 INVALID NUMBERS", "Provide task numbers separated by commas e.g. `1,3,5`.", color=0xE63946)
+        )
+        return
+
+    invalid = [n for n in indices if n < 1 or n > len(todos)]
+    if invalid:
+        await interaction.response.send_message(
+            embed=make_embed("\u25b2 OUT OF RANGE", f"Task(s) {', '.join(str(n) for n in invalid)} don't exist. Check `/todo list`.", color=0xE63946)
+        )
+        return
+
+    for n in indices:
+        todos[n - 1]["priority"] = priority_val
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    priority_labels = {"p1": "P1 \u2014 Critical", "p2": "P2 \u2014 Important", "p3": "P3 \u2014 Normal", "none": "None (cleared)"}
+    color_map       = {"p1": 0xE63946, "p2": 0xF0A500, "p3": 0xF5C542, "none": 0x6B6B9A}
+    task_names      = ", ".join(f"**#{n}**" for n in indices)
+
+    await interaction.response.send_message(
+        embed=make_embed(
+            "\u25c9 PRIORITY SET",
+            f"{task_names} \u2192 **{priority_labels[lvl]}**",
+            color=color_map[lvl]
         )
     )
 
@@ -605,7 +693,6 @@ async def echoes(interaction: discord.Interaction):
         return
 
     count  = int(member.get("echoCount", 0))
-    tier   = get_tier(count)
     active = get_active_date(uid, data)
     todos  = get_todos_for_date(uid, active, data)
     done   = sum(1 for t in todos if t["done"])
@@ -615,12 +702,11 @@ async def echoes(interaction: discord.Interaction):
     is_today      = active == today_str()
     session_label = "Today's Objectives" if is_today else f"Objectives ({active})"
 
-    embed = discord.Embed(title=f"☽ {member['codename']}", color=tier["color"])
-    embed.add_field(name="Shadow ID",      value=f"`{shadow_id}`",             inline=True)
-    embed.add_field(name="Echo Resonance", value=f"**{count:,}**",             inline=True)
-    embed.add_field(name="Rank",           value=f"**{tier['name'].upper()}**", inline=True)
-    embed.add_field(name=session_label,    value=f"{done}/{total} fulfilled · +{proj} resonating", inline=False)
-    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+    embed = discord.Embed(title=f"☭ {member['codename']}", color=0x7B2FBE)
+    embed.add_field(name="Shadow ID",      value=f"`{shadow_id}`",        inline=True)
+    embed.add_field(name="Echo Resonance", value=f"**{count:,} echoes**", inline=True)
+    embed.add_field(name=session_label,    value=f"{done}/{total} fulfilled · +{proj} echoes on track", inline=False)
+    embed.set_footer(text="☭ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
     await interaction.response.send_message(embed=embed)
 
 # ── /leaderboard ──────────────────────────────────────────────────
@@ -643,9 +729,8 @@ async def leaderboard(interaction: discord.Interaction):
     medals = ["🥇","🥈","🥉"]
     for i, m in enumerate(sorted_m):
         count = int(m.get("echoCount", 0))
-        tier  = get_tier(count)
         rank  = medals[i] if i < 3 else f"`#{i+1}`"
-        lines.append(f"{rank} **{m['codename']}** · `{m['shadowId']}` · **{count:,}** _{tier['name']}_")
+        lines.append(f"{rank} **{m['codename']}** · `{m['shadowId']}` · **{count:,} echoes**")
 
     embed = make_embed("☽ LEADERBOARD — TOP OPERATIVES", "\n".join(lines), color=0xF0A500)
     embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT · {len(data['members'])} total operatives")
