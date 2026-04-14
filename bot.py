@@ -354,9 +354,9 @@ async def create_member_on_gas(member: dict) -> bool:
 # Stores: uid -> {task, start_time, session_type, in_vc, channel_id, message_id, guild_id, pomodoro_end}
 _session_messages = {}   # uid -> discord.Message (for editing)
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=20)
 async def session_ticker():
-    """Every minute: update live timer embeds + check pomodoro end."""
+    """Every 20 seconds: update live timer embeds + check pomodoro end."""
     data = await load_data()
     now  = time_module.time()
 
@@ -370,35 +370,43 @@ async def session_ticker():
             elapsed  = int(now - sess["start_time"])
             is_pomo  = sess["session_type"] == "pomodoro"
             pomo_end = sess.get("pomodoro_end")
+            timer_total = sess.get("timer_total")
 
-            if is_pomo and pomo_end:
+            # Timed session (pomodoro OR study with duration)
+            if pomo_end and timer_total:
                 remaining = max(0, int(pomo_end - now))
-                total_s   = POMODORO_MINUTES * 60
-                bar       = make_progress_bar(total_s - remaining, total_s)
+                bar       = make_progress_bar(timer_total - remaining, timer_total)
                 time_str  = format_duration(remaining)
-                status    = "⏰ POMODORO ENDING SOON" if remaining < 120 else "🍅 POMODORO IN PROGRESS"
 
-                embed = make_embed(
-                    status,
-                    f"**{sess['task']}**\n\n"
-                    f"`[{bar}]` **{time_str} left**\n"
-                    f"Elapsed: {format_duration(elapsed)}\n\n"
-                    f"{'🔔 Time is almost up! Use `/endsession` to submit proof.' if remaining < 120 else 'Stay locked in. Use `/endsession` when done.'}",
-                    color=0xF0A500 if remaining < 120 else 0xA855F7
-                )
-                embed.set_author(name=f"Operative: {sess.get('codename', uid)}")
+                if is_pomo:
+                    status = "⏰ POMODORO ENDING SOON" if remaining < 120 else "🍅 POMODORO IN PROGRESS"
+                    done_label = "🍅 POMODORO COMPLETE"
+                    done_body  = "25 minutes locked in. Use `/endsession` to submit proof and claim your echoes."
+                else:
+                    mins = timer_total // 60
+                    status = "⏰ SESSION ENDING SOON" if remaining < 120 else f"⏱️ TIMED SESSION — {mins}min"
+                    done_label = "⏱️ TIMER COMPLETE"
+                    done_body  = f"{mins}-minute session done. Use `/endsession` to submit proof and claim echoes."
 
-                # Pomodoro ended
                 if remaining == 0:
                     embed = make_embed(
-                        "🍅 POMODORO COMPLETE",
-                        f"**{sess['task']}**\n\n"
-                        f"25 minutes locked in. Use `/endsession` to submit proof and claim your echoes.",
+                        done_label,
+                        f"**{sess['task']}**\n\n{done_body}",
                         color=0x10B981
                     )
+                else:
+                    embed = make_embed(
+                        status,
+                        f"**{sess['task']}**\n\n"
+                        f"`[{bar}]` **{time_str} left**\n"
+                        f"Elapsed: {format_duration(elapsed)}\n\n"
+                        f"{'🔔 Time is almost up! Use `/endsession` to submit proof.' if remaining < 120 else 'Stay locked in. Use `/endsession` when done.'}",
+                        color=0xF0A500 if remaining < 120 else 0xA855F7
+                    )
+                embed.set_author(name=f"Operative: {sess.get('codename', uid)}")
 
             else:
-                # Open-ended study session
+                # Open-ended study session (no timer)
                 hours_done = elapsed // 3600
                 next_milestone = None
                 for mhr in sorted(MILESTONE_BONUSES.keys()):
@@ -525,7 +533,7 @@ async def daily_echo_task():
 #  STUDY SESSION COMMANDS
 # ══════════════════════════════════════════════════════════════════
 
-async def _start_session(interaction: discord.Interaction, task: str, session_type: str):
+async def _start_session(interaction: discord.Interaction, task: str, session_type: str, duration_minutes: int = None):
     """Shared logic for /study and /pomodoro."""
     data      = await load_data()
     uid       = str(interaction.user.id)
@@ -555,8 +563,18 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
             in_vc      = True
             vc_channel = member_obj.voice.channel.name
 
-    now      = time_module.time()
-    pomo_end = now + (POMODORO_MINUTES * 60) if session_type == "pomodoro" else None
+    now = time_module.time()
+
+    # Determine timer end
+    if session_type == "pomodoro":
+        timer_end = now + (POMODORO_MINUTES * 60)
+        timer_total = POMODORO_MINUTES * 60
+    elif duration_minutes:
+        timer_end   = now + (duration_minutes * 60)
+        timer_total = duration_minutes * 60
+    else:
+        timer_end   = None
+        timer_total = None
 
     session = {
         "task":         task,
@@ -568,14 +586,22 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
         "guild_id":     str(interaction.guild_id),
         "shadow_id":    shadow_id,
         "codename":     codename,
-        "pomodoro_end": pomo_end,
+        "pomodoro_end": timer_end,   # reused for custom timer too
+        "timer_total":  timer_total,
     }
     data["active_sessions"][uid] = session
     await save_data(data)
 
-    vc_note   = f"\n🎙️ Detected in **{vc_channel}** — VC bonus active!" if in_vc else "\n💡 Join a VC channel for a higher echo rate."
-    type_note = f"🍅 **POMODORO** — 25 minutes locked." if session_type == "pomodoro" else "☽ **STUDY SESSION** — open-ended."
-    bar       = make_progress_bar(0, 3600)
+    vc_note = f"\n🎙️ Detected in **{vc_channel}** — VC bonus active!" if in_vc else "\n💡 Join a VC channel for a higher echo rate."
+
+    if session_type == "pomodoro":
+        type_note = f"🍅 **POMODORO** — 25 minutes locked."
+    elif duration_minutes:
+        type_note = f"⏱️ **TIMED SESSION** — {duration_minutes} minutes set."
+    else:
+        type_note = "☽ **STUDY SESSION** — open-ended."
+
+    bar = make_progress_bar(0, timer_total or 3600)
 
     embed = make_embed(
         "◉ SESSION STARTED",
@@ -604,10 +630,18 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
         await focus_ch.send(embed=log_embed)
 
 
-@tree.command(name="study", description="Start an open-ended focus session")
-@app_commands.describe(task="What are you working on?")
-async def study(interaction: discord.Interaction, task: str):
-    await _start_session(interaction, task, "study")
+@tree.command(name="study", description="Start a focus session — open-ended or with a timer")
+@app_commands.describe(
+    task="What are you working on?",
+    duration="Optional timer in minutes (e.g. 60 for 1 hour). Leave blank for open-ended."
+)
+async def study(interaction: discord.Interaction, task: str, duration: int = None):
+    if duration is not None and duration < 1:
+        await interaction.response.send_message(
+            embed=make_embed("▲ INVALID DURATION", "Duration must be at least 1 minute.", color=0xE63946)
+        )
+        return
+    await _start_session(interaction, task, "study", duration_minutes=duration)
 
 
 @tree.command(name="pomodoro", description="Start a 25-minute Pomodoro session")
@@ -617,8 +651,11 @@ async def pomodoro(interaction: discord.Interaction, task: str):
 
 
 @tree.command(name="endsession", description="End your active session, submit proof, and claim echoes")
-@app_commands.describe(proof="Paste an image link or describe what you accomplished")
-async def endsession(interaction: discord.Interaction, proof: str):
+@app_commands.describe(
+    proof="Upload an image OR paste a link/text as proof of your session",
+    attachment="Upload a screenshot or photo as proof (renders in the embed)"
+)
+async def endsession(interaction: discord.Interaction, proof: str = None, attachment: discord.Attachment = None):
     data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
@@ -636,6 +673,13 @@ async def endsession(interaction: discord.Interaction, proof: str):
         )
         return
 
+    if not proof and not attachment:
+        await interaction.response.send_message(
+            embed=make_embed("▲ PROOF REQUIRED", "Submit proof to end your session — upload an image or describe what you accomplished.", color=0xE63946)
+        )
+        return
+
+    # Acknowledge immediately so Discord doesn't time out
     await interaction.response.defer()
 
     now              = time_module.time()
@@ -649,14 +693,16 @@ async def endsession(interaction: discord.Interaction, proof: str):
     echo_info = calculate_session_echoes(duration_seconds, daily_earned)
 
     # Award echoes
+    sg_count = 0
+    new_badge = False
     for i, m in enumerate(data["members"]):
         if m["shadowId"] == shadow_id:
             old = int(m.get("echoCount", 0))
             data["members"][i]["echoCount"] = old + echo_info["awarded"]
 
             # Badge tracking — Shadow Grind
-            badges    = data["members"][i].get("badges", {})
-            sg_count  = badges.get("shadow_grind", 0)
+            badges   = data["members"][i].get("badges", {})
+            sg_count = badges.get("shadow_grind", 0)
             new_badge = echo_info["hours"] >= MAX_SESSION_HOURS
             if new_badge:
                 sg_count += 1
@@ -674,23 +720,39 @@ async def endsession(interaction: discord.Interaction, proof: str):
     await save_data(data)
 
     # Remove live message
-    if uid in _session_messages:
-        del _session_messages[uid]
+    _session_messages.pop(uid, None)
 
-    # Build result embed
+    # ── Resolve proof link ─────────────────────────────────────────
+    # Priority: uploaded attachment > URL in proof text > plain text
+    proof_image_url = None
+    proof_display   = proof or ""
+
+    if attachment:
+        # Discord CDN link from the uploaded file
+        proof_image_url = attachment.url
+        proof_display   = attachment.url
+    elif proof:
+        is_image_url = (
+            proof.startswith("http") and (
+                any(proof.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"])
+                or "cdn.discordapp.com" in proof
+                or "imgur.com" in proof
+                or "i.ibb.co" in proof
+                or "media.discordapp.net" in proof
+            )
+        )
+        if is_image_url:
+            proof_image_url = proof
+
+    # ── Build result embed ─────────────────────────────────────────
     milestone_lines = ""
     if echo_info["milestones"]:
         milestone_lines = "\n" + "\n".join(
             f"🏆 **{hr}h milestone** → +{bonus} echoes" for hr, bonus in echo_info["milestones"]
         )
 
-    badge_line = ""
-    member = get_member(shadow_id, data)
-    sg_count = member.get("badges", {}).get("shadow_grind", 0) if member else 0
-    if echo_info["hours"] >= MAX_SESSION_HOURS:
-        badge_line = f"\n\n🏅 **SHADOW GRIND BADGE EARNED!** You now have **{sg_count}** Shadow Grind badge(s)."
-
-    cap_note = "\n⚠️ Daily echo cap reached — some echoes were not awarded." if echo_info["capped"] else ""
+    badge_line = f"\n\n🏅 **SHADOW GRIND BADGE EARNED!** You now have **{sg_count}** Shadow Grind badge(s)." if new_badge else ""
+    cap_note   = "\n⚠️ Daily echo cap reached — some echoes were not awarded." if echo_info["capped"] else ""
 
     embed = make_embed(
         "☽ SESSION COMPLETE",
@@ -704,31 +766,41 @@ async def endsession(interaction: discord.Interaction, proof: str):
     )
     embed.set_author(name=f"Operative: {sess['codename']}")
 
-    # Detect if proof is an image link
-    proof_is_link = proof.startswith("http") and any(
-        proof.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]
-    ) or "cdn.discordapp.com" in proof or "imgur.com" in proof or "i.ibb.co" in proof
-
-    if proof_is_link:
-        embed.set_image(url=proof)
-
-    embed.add_field(name="Proof", value=proof if not proof_is_link else f"[Image Link]({proof})", inline=False)
+    if proof_image_url:
+        embed.set_image(url=proof_image_url)
+        embed.add_field(
+            name="Proof",
+            value=f"[View Image]({proof_image_url})",
+            inline=False
+        )
+    elif proof_display:
+        embed.add_field(name="Proof", value=proof_display[:1024], inline=False)
 
     await interaction.followup.send(embed=embed)
 
-    # Push proof to GAS (no image stored in MongoDB)
+    # ── Push to GAS (fire-and-forget, won't block or cause timeout) ─
     sess_data = {
         **sess,
         "duration_seconds": duration_seconds,
         "hours":            echo_info["hours"],
         "awarded":          echo_info["awarded"],
-        "proof_link":       proof if proof_is_link else "",
-        "proof_text":       proof if not proof_is_link else "",
+        "proof_link":       proof_image_url or "",
+        "proof_text":       proof_display if not proof_image_url else "",
         "shadow_id":        shadow_id,
         "codename":         sess.get("codename", shadow_id),
     }
-    asyncio.create_task(push_proof_to_gas(sess_data))
-    asyncio.create_task(push_to_gas(data))
+
+    async def _background_push():
+        try:
+            await push_proof_to_gas(sess_data)
+        except Exception as e:
+            print(f"[BG PROOF PUSH ERROR] {e}")
+        try:
+            await push_to_gas(data)
+        except Exception as e:
+            print(f"[BG GAS PUSH ERROR] {e}")
+
+    asyncio.create_task(_background_push())
 
     # Announce in focus-log
     focus_ch = discord.utils.get(interaction.guild.text_channels, name=FOCUS_LOG_CHANNEL)
@@ -740,6 +812,8 @@ async def endsession(interaction: discord.Interaction, proof: str):
             f"{badge_line}",
             color=0x10B981
         )
+        if proof_image_url:
+            log_embed.set_image(url=proof_image_url)
         await focus_ch.send(embed=log_embed)
 
 
