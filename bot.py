@@ -77,19 +77,35 @@ def get_db():
 # ── DATA LOAD/SAVE ────────────────────────────────────────────────
 DATA_FILE = "data.json"
 
+def _sanitize_members(raw: list) -> list:
+    """Ensure every element in the members list is a dict, not a JSON string."""
+    result = []
+    for m in raw:
+        if isinstance(m, str):
+            try:
+                parsed = json.loads(m)
+                if isinstance(parsed, dict):
+                    result.append(parsed)
+            except Exception:
+                pass  # skip malformed entries
+        elif isinstance(m, dict):
+            result.append(m)
+    return result
+
 async def load_data():
     db = get_db()
     if db is not None:
-        doc         = await db["config"].find_one({"_id": "main"}) or {}
-        members_doc = await db["members"].find_one({"_id": "list"}) or {}
+        doc          = await db["config"].find_one({"_id": "main"}) or {}
+        members_doc  = await db["members"].find_one({"_id": "list"}) or {}
         sessions_doc = await db["sessions"].find_one({"_id": "active"}) or {}
+        raw_members  = members_doc.get("members", [])
         return {
-            "base_echo_rate": doc.get("base_echo_rate", 10),
-            "links":          doc.get("links", {}),
-            "pending_links":  doc.get("pending_links", {}),
-            "todos":          doc.get("todos", {}),
-            "members":        members_doc.get("members", []),
-            "active_sessions": sessions_doc.get("sessions", {}),
+            "base_echo_rate":       doc.get("base_echo_rate", 10),
+            "links":                doc.get("links", {}),
+            "pending_links":        doc.get("pending_links", {}),
+            "todos":                doc.get("todos", {}),
+            "members":              _sanitize_members(raw_members),
+            "active_sessions":      sessions_doc.get("sessions", {}),
             "daily_session_echoes": doc.get("daily_session_echoes", {}),
         }
     else:
@@ -271,7 +287,7 @@ async def pull_from_gas(data: dict):
                 text    = await resp.text()
                 members = json.loads(text)
                 if isinstance(members, list) and members:
-                    data["members"] = members
+                    data["members"] = _sanitize_members(members)
                     await save_data(data)
                     return True
     except Exception as e:
