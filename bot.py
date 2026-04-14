@@ -619,8 +619,9 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
 
     # Determine timer end
     if session_type == "pomodoro":
-        timer_end = now + (POMODORO_MINUTES * 60)
-        timer_total = POMODORO_MINUTES * 60
+        pomo_mins   = duration_minutes or POMODORO_MINUTES
+        timer_end   = now + (pomo_mins * 60)
+        timer_total = pomo_mins * 60
     elif duration_minutes:
         timer_end   = now + (duration_minutes * 60)
         timer_total = duration_minutes * 60
@@ -932,13 +933,15 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
     def make_session_log_embed():
         e = make_embed(
             "✅ SESSION LOGGED",
-            f"{interaction.user.mention} completed a **{sess['session_type']}** session\n"
+            f"**{sess['codename']}** completed a **{sess['session_type']}** session\n"
             f"**{sess['task']}** · {format_duration(duration_seconds)} · **+{echo_info['awarded']} echoes**"
             f"{badge_line}",
             color=0x10B981
         )
         if proof_image_url:
             e.set_image(url=proof_image_url)
+        elif proof_display:
+            e.add_field(name="Proof", value=proof_display[:1024], inline=False)
         e.set_author(name=f"Operative: {sess['codename']}")
         return e
 
@@ -1175,69 +1178,130 @@ async def phantom_alert_task():
 #  VC TRACKING
 # ══════════════════════════════════════════════════════════════════
 
+# In-memory VC join timestamps for time tracking: uid -> join_epoch
+_vc_join_times: dict = {}
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Detect VC joins and prompt users to start a study session."""
+    """Detect VC joins/leaves — track time, DM ping user, show timer if session running."""
     if member.bot:
         return
 
     uid  = str(member.id)
     data = await load_data()
+    now  = time_module.time()
 
-    # Someone joined a VC (wasn't in one before)
     joined = before.channel is None and after.channel is not None
-    # Someone left a VC
     left   = before.channel is not None and after.channel is None
 
     if joined:
+        # Track VC join time for ALL users (linked or not)
+        _vc_join_times[uid] = now
+
         shadow_id = get_shadow_id(uid, data)
         if not shadow_id:
-            return  # Not linked, ignore
+            return  # Not linked — time tracked, nothing else to do
 
         m_obj    = get_member(shadow_id, data)
         codename = m_obj.get("codename", shadow_id) if m_obj else shadow_id
 
-        # If they already have an active session — just update VC status and notify
-        # DO NOT touch task, timer, or any session settings
+        # Update session VC status if session is active
         if uid in data["active_sessions"]:
             data["active_sessions"][uid]["in_vc"]      = True
             data["active_sessions"][uid]["vc_channel"] = after.channel.name
             await save_data(data)
 
-            # Post a non-intrusive note in focus-log
+            sess        = data["active_sessions"][uid]
+            elapsed     = int(now - sess["start_time"])
+            pomo_end    = sess.get("pomodoro_end")
+            timer_total = sess.get("timer_total")
+            is_pomo     = sess["session_type"] == "pomodoro"
+
+            if pomo_end and timer_total:
+                remaining = max(0, int(pomo_end - now))
+                bar       = make_progress_bar(timer_total - remaining, timer_total)
+                if is_pomo:
+                    status_title = "🍅 POMODORO IN PROGRESS"
+                else:
+                    mins = timer_total // 60
+                    status_title = f"⏱️ TIMED SESSION — {mins}min"
+                dm_desc = (
+                    f"**{sess['task']}**\n\n"
+                    f"`[{bar}]` **{format_duration(remaining)} left**\n"
+                    f"Elapsed: {format_duration(elapsed)}\n\n"
+                    f"VC bonus now active — keep grinding."
+                )
+            else:
+                bar = make_progress_bar(elapsed % 3600, 3600)
+                status_title = "☽ FOCUS SESSION IN PROGRESS"
+                dm_desc = (
+                    f"**{sess['task']}**\n\n"
+                    f"`[{bar}]` **{format_duration(elapsed)} elapsed**\n\n"
+                    f"VC bonus now active — keep grinding."
+                )
+
+            dm_embed = make_embed(status_title, dm_desc, color=0xA855F7)
+            dm_embed.set_author(name=f"Operative: {codename}")
+            dm_embed.set_footer(text=f"Joined {after.channel.name} · VC bonus active")
+            try:
+                await member.send(embed=dm_embed)
+            except Exception:
+                pass
+
+            # Post note in focus-log (codename only, no mention)
             focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
             if focus_ch:
-                sess     = data["active_sessions"][uid]
-                elapsed  = int(time_module.time() - sess["start_time"])
-                embed    = make_embed(
-                    "🎙️ SEEKER IDENTIFIED IN VC",
+                log_embed = make_embed(
+                    "SEEKER IDENTIFIED IN VC",
                     f"**{codename}** detected in **{after.channel.name}** · {format_duration(elapsed)} into session\n"
                     f"VC bonus now active — keep grinding.",
                     color=0x6B6B9A
                 )
-                embed.set_author(name=f"Operative: {codename}")
-                await focus_ch.send(embed=embed)
+                log_embed.set_author(name=f"Operative: {codename}")
+                await focus_ch.send(embed=log_embed)
             return
 
-        # No active session — post prompt
+        # No active session — DM the user and post in focus-log
+        try:
+            prompt_embed = make_embed(
+                "YOU ENTERED THE VOID",
+                f"You joined **{after.channel.name}**.\n\n"
+                f"Start a session to earn echoes while you're here.\n"
+                f"Use `/study <task>` or `/pomodoro <task>` to lock in.",
+                color=0x6B6B9A
+            )
+            prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
+            await member.send(embed=prompt_embed)
+        except Exception:
+            pass
+
         focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
         if focus_ch:
-            embed    = make_embed(
-                "☽ OPERATIVE ENTERED THE VOID",
-                f"{member.mention} joined **{after.channel.name}**\n\n"
-                f"Use `/study <task>` or `/pomodoro <task>` to lock in your session and earn echoes.\n"
-                f"🎙️ VC detected — you'll earn at the active rate.",
+            embed = make_embed(
+                "OPERATIVE ENTERED THE VOID",
+                f"**{codename}** joined **{after.channel.name}**\n\n"
+                f"Use `/study <task>` or `/pomodoro <task>` to lock in and earn echoes.\n"
+                f"VC detected — active rate applies.",
                 color=0x6B6B9A
             )
             embed.set_author(name=f"Operative: {codename}")
             await focus_ch.send(embed=embed)
 
     elif left:
-        # If they had an active session and were in VC, update VC status
+        # Log VC time for ALL users
+        join_time = _vc_join_times.pop(uid, None)
+        if join_time:
+            vc_seconds = int(now - join_time)
+            if "vc_time" not in data:
+                data["vc_time"] = {}
+            data["vc_time"][uid] = data["vc_time"].get(uid, 0) + vc_seconds
+
+        # Update session VC status
         if uid in data["active_sessions"]:
             data["active_sessions"][uid]["in_vc"]      = False
             data["active_sessions"][uid]["vc_channel"] = ""
-            await save_data(data)
+
+        await save_data(data)
 
 # ══════════════════════════════════════════════════════════════════
 #  SLASH COMMANDS (existing)
