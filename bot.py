@@ -63,6 +63,8 @@ MILESTONE_BONUSES    = {3: 2, 5: 3, 7: 5}   # hours -> bonus echoes
 MAX_SESSION_HOURS    = 7
 DAILY_SESSION_CAP    = 31                     # 7*3 + 2+3+5
 FOCUS_LOG_CHANNEL    = os.getenv("FOCUS_LOG_CHANNEL", "focus-log")
+DEEP_WORK_LOG_CHANNEL = os.getenv("DEEP_WORK_LOG_CHANNEL", "deep-work-logs")
+GENERAL_CHANNEL      = os.getenv("GENERAL_CHANNEL", "general")
 POMODORO_MINUTES     = 25
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────
@@ -694,18 +696,23 @@ async def study(interaction: discord.Interaction, task: str, duration: int = Non
     await _start_session(interaction, task, "study", duration_minutes=duration)
 
 
-@tree.command(name="pomodoro", description="Start a timed Pomodoro session — 25, 50, 90 min or custom")
+@tree.command(name="pomodoro", description="Start a timed Pomodoro session — 25, 50, 90 min or any custom duration")
 @app_commands.describe(
     task="What are you working on?",
-    duration="Session length — pick 25/50/90 or type any number for custom minutes (default: 25)",
+    duration="Minutes — choose 25/50/90 or type any number up to 300 (default: 25)",
 )
 @app_commands.choices(duration=[
     app_commands.Choice(name="25 min — Classic Pomodoro", value=25),
     app_commands.Choice(name="50 min — Deep Work",        value=50),
     app_commands.Choice(name="90 min — Flow State",       value=90),
 ])
-async def pomodoro(interaction: discord.Interaction, task: str, duration: int = 25):
-    mins = max(1, min(duration, 300))
+async def pomodoro(interaction: discord.Interaction, task: str, duration: app_commands.Choice[int] | int = 25):
+    # Handle both Choice object (from dropdown) and raw int (typed manually)
+    if isinstance(duration, app_commands.Choice):
+        mins = duration.value
+    else:
+        mins = int(duration)
+    mins = max(1, min(mins, 300))
     await _start_session(interaction, task, "pomodoro", duration_minutes=mins)
 
 
@@ -921,19 +928,29 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
 
     asyncio.create_task(_background_push())
 
-    # Announce in focus-log
-    focus_ch = discord.utils.get(interaction.guild.text_channels, name=FOCUS_LOG_CHANNEL)
-    if focus_ch and focus_ch.id != interaction.channel_id:
-        log_embed = make_embed(
-            "✅ SESSION SUBMITTED",
-            f"{interaction.user.mention} completed a {sess['session_type']} session\n"
+    # Announce in focus-log + deep-work-logs + general
+    focus_ch     = discord.utils.get(interaction.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+    deep_work_ch = discord.utils.get(interaction.guild.text_channels, name=DEEP_WORK_LOG_CHANNEL)
+    general_ch   = discord.utils.get(interaction.guild.text_channels, name=GENERAL_CHANNEL)
+
+    def make_session_log_embed():
+        e = make_embed(
+            "✅ SESSION LOGGED",
+            f"{interaction.user.mention} completed a **{sess['session_type']}** session\n"
             f"**{sess['task']}** · {format_duration(duration_seconds)} · **+{echo_info['awarded']} echoes**"
             f"{badge_line}",
             color=0x10B981
         )
         if proof_image_url:
-            log_embed.set_image(url=proof_image_url)
-        await focus_ch.send(embed=log_embed)
+            e.set_image(url=proof_image_url)
+        e.set_author(name=f"Operative: {sess['codename']}")
+        return e
+
+    announced_channels = set()
+    for ch in [focus_ch, deep_work_ch, general_ch]:
+        if ch and ch.id != interaction.channel_id and ch.id not in announced_channels:
+            announced_channels.add(ch.id)
+            await ch.send(embed=make_session_log_embed())
 
 
 @tree.command(name="sessions", description="View your session stats and weekly analytics")
@@ -1181,18 +1198,34 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if not shadow_id:
             return  # Not linked, ignore
 
-        # Update active session VC status if they have one
+        m_obj    = get_member(shadow_id, data)
+        codename = m_obj.get("codename", shadow_id) if m_obj else shadow_id
+
+        # If they already have an active session — just update VC status and notify
+        # DO NOT touch task, timer, or any session settings
         if uid in data["active_sessions"]:
             data["active_sessions"][uid]["in_vc"]      = True
             data["active_sessions"][uid]["vc_channel"] = after.channel.name
             await save_data(data)
+
+            # Post a non-intrusive note in focus-log
+            focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+            if focus_ch:
+                sess     = data["active_sessions"][uid]
+                elapsed  = int(time_module.time() - sess["start_time"])
+                embed    = make_embed(
+                    "🎙️ SEEKER IDENTIFIED IN VC",
+                    f"**{codename}** detected in **{after.channel.name}** · {format_duration(elapsed)} into session\n"
+                    f"VC bonus now active — keep grinding.",
+                    color=0x6B6B9A
+                )
+                embed.set_author(name=f"Operative: {codename}")
+                await focus_ch.send(embed=embed)
             return
 
-        # Post in focus-log channel prompting them to start a session
+        # No active session — post prompt
         focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
         if focus_ch:
-            m_obj    = get_member(shadow_id, data)
-            codename = m_obj.get("codename", shadow_id) if m_obj else shadow_id
             embed    = make_embed(
                 "☽ OPERATIVE ENTERED THE VOID",
                 f"{member.mention} joined **{after.channel.name}**\n\n"
@@ -1792,12 +1825,14 @@ tree.add_command(op_group)
 # ── /echoes ───────────────────────────────────────────────────────
 @tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
 async def echoes(interaction: discord.Interaction):
+    await interaction.response.defer()
+
     data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
 
     if not shadow_id:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NOT LINKED", "No Shadow ID linked. Use `/link <shadow_id> <n>` to get started.", color=0xE63946),
         )
         return
@@ -1805,10 +1840,11 @@ async def echoes(interaction: discord.Interaction):
     member = get_member(shadow_id, data)
     if not member:
         await pull_from_gas(data)
-        member = get_member(shadow_id, await load_data())
+        data   = await load_data()
+        member = get_member(shadow_id, data)
 
     if not member:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ OPERATIVE NOT FOUND", f"Shadow ID `{shadow_id}` has no record in the void.", color=0xE63946),
         )
         return
@@ -1824,24 +1860,32 @@ async def echoes(interaction: discord.Interaction):
     session_label = "Today's Objectives" if is_today else f"Objectives ({active})"
 
     # Session stats
-    today     = today_str()
-    daily_key = f"{uid}_{today}"
+    today      = today_str()
+    daily_key  = f"{uid}_{today}"
     daily_sess = data.get("daily_session_echoes", {}).get(daily_key, 0)
-    sg_count   = member.get("badges", {}).get("shadow_grind", 0)
+    sg_count   = member.get("badges", {})
+    if isinstance(sg_count, str):
+        try: sg_count = json.loads(sg_count)
+        except: sg_count = {}
+    sg_count = sg_count.get("shadow_grind", 0) if isinstance(sg_count, dict) else 0
 
-    embed = discord.Embed(title=f"☭ {member['codename']}", color=0x7B2FBE)
+    tier  = get_tier(count)
+    embed = discord.Embed(title=f"☭ {member['codename']}", color=tier["color"])
     embed.add_field(name="Shadow ID",      value=f"`{shadow_id}`",        inline=True)
     embed.add_field(name="Echo Resonance", value=f"**{count:,} echoes**", inline=True)
+    embed.add_field(name="Rank",           value=f"**{tier['name']}**",   inline=True)
     embed.add_field(name=session_label,    value=f"{done}/{total} fulfilled · +{proj} echoes on track", inline=False)
     embed.add_field(name="Study Echoes Today", value=f"{daily_sess}/{DAILY_SESSION_CAP}", inline=True)
     if sg_count:
         embed.add_field(name="Shadow Grind", value=f"🏅 × {sg_count}", inline=True)
     embed.set_footer(text="☭ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 # ── /leaderboard ──────────────────────────────────────────────────
 @tree.command(name="leaderboard", description="The most powerful operatives in the Order")
 async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+
     data = await load_data()
     if not data["members"]:
         await pull_from_gas(data)
@@ -1850,7 +1894,7 @@ async def leaderboard(interaction: discord.Interaction):
     sorted_m = sorted(data["members"], key=lambda m: int(m.get("echoCount", 0)), reverse=True)[:10]
 
     if not sorted_m:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NO DATA", "No operatives found. Try `/sync` first.", color=0xE63946),
         )
         return
@@ -1860,13 +1904,18 @@ async def leaderboard(interaction: discord.Interaction):
     for i, m in enumerate(sorted_m):
         count    = int(m.get("echoCount", 0))
         rank     = medals[i] if i < 3 else f"`#{i+1}`"
-        sg_count = m.get("badges", {}).get("shadow_grind", 0)
+        tier     = get_tier(count)
+        sg_count = m.get("badges", {})
+        if isinstance(sg_count, str):
+            try: sg_count = json.loads(sg_count)
+            except: sg_count = {}
+        sg_count = sg_count.get("shadow_grind", 0) if isinstance(sg_count, dict) else 0
         badge    = f" · 🏅×{sg_count}" if sg_count else ""
-        lines.append(f"{rank} **{m['codename']}** · `{m['shadowId']}` · **{count:,} echoes**{badge}")
+        lines.append(f"{rank} **{m['codename']}** · `{m['shadowId']}` · **{count:,} echoes** · *{tier['name']}*{badge}")
 
     embed = make_embed("☽ LEADERBOARD — TOP OPERATIVES", "\n".join(lines), color=0xF0A500)
     embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · {len(data['members'])} total operatives")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 # ── /link ─────────────────────────────────────────────────────────
 @tree.command(name="link", description="Bind your Discord identity to your Shadow ID")
