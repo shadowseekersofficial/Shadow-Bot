@@ -1935,6 +1935,8 @@ async def on_ready():
     else:
         print("[SHADOW BOT] WARNING: MONGO_URI not set — using local file")
 
+    setup_ai_missions(bot, tree)
+
     try:
         synced = await tree.sync()
         print(f"[SHADOW BOT] Synced {len(synced)} slash commands")
@@ -1957,11 +1959,9 @@ async def on_ready():
 
     daily_echo_task.start()
     session_ticker.start()
+    ai_mission_task.start()
     print(f"[SHADOW BOT] Daily task scheduled at {EOD_HOUR}:{EOD_MINUTE:02d} {TIMEZONE}")
     print(f"[SHADOW BOT] Session ticker started")
-
-    setup_ai_missions(bot, tree)
-    ai_mission_task.start()
     print("[SHADOW BOT] AI Mission Generator started")
 
 bot.run(TOKEN)
