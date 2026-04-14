@@ -705,6 +705,20 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         )
         return
 
+    # Corrupted session in DB (stored as string instead of dict) — wipe it
+    if isinstance(sess, str):
+        try:
+            import json as _json
+            sess = _json.loads(sess)
+            data["active_sessions"][uid] = sess
+        except Exception:
+            del data["active_sessions"][uid]
+            await save_data(data)
+            await interaction.response.send_message(
+                embed=make_embed("▲ SESSION CORRUPTED", "Your session data was corrupted and has been cleared. Start a fresh session with `/study`.", color=0xE63946)
+            )
+            return
+
     if not proof and not attachment:
         await interaction.response.send_message(
             embed=make_embed("▲ PROOF REQUIRED", "Submit proof to end your session — upload an image or describe what you accomplished.", color=0xE63946)
