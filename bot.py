@@ -676,10 +676,19 @@ async def study(interaction: discord.Interaction, task: str, duration: int = Non
     await _start_session(interaction, task, "study", duration_minutes=duration)
 
 
-@tree.command(name="pomodoro", description="Start a 25-minute Pomodoro session")
-@app_commands.describe(task="What are you working on?")
-async def pomodoro(interaction: discord.Interaction, task: str):
-    await _start_session(interaction, task, "pomodoro")
+@tree.command(name="pomodoro", description="Start a timed Pomodoro session — 25, 50, 90 min or custom")
+@app_commands.describe(
+    task="What are you working on?",
+    duration="Session length — pick 25/50/90 or type any number for custom minutes (default: 25)",
+)
+@app_commands.choices(duration=[
+    app_commands.Choice(name="25 min — Classic Pomodoro", value=25),
+    app_commands.Choice(name="50 min — Deep Work",        value=50),
+    app_commands.Choice(name="90 min — Flow State",       value=90),
+])
+async def pomodoro(interaction: discord.Interaction, task: str, duration: int = 25):
+    mins = max(1, min(duration, 300))
+    await _start_session(interaction, task, "pomodoro", duration_minutes=mins)
 
 
 @tree.command(name="endsession", description="End your active session, submit proof, and claim echoes")
@@ -748,7 +757,14 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
                 data["members"][i]["echoCount"] = old + echo_info["awarded"]
 
                 # Badge tracking — Shadow Grind
-                badges   = data["members"][i].get("badges", {})
+                badges = data["members"][i].get("badges", {})
+                if isinstance(badges, str):
+                    try:
+                        badges = json.loads(badges)
+                    except Exception:
+                        badges = {}
+                if not isinstance(badges, dict):
+                    badges = {}
                 sg_count = badges.get("shadow_grind", 0)
                 new_badge = echo_info["hours"] >= MAX_SESSION_HOURS
                 if new_badge:
