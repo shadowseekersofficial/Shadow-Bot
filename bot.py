@@ -706,12 +706,8 @@ async def study(interaction: discord.Interaction, task: str, duration: int = Non
     app_commands.Choice(name="50 min — Deep Work",        value=50),
     app_commands.Choice(name="90 min — Flow State",       value=90),
 ])
-async def pomodoro(interaction: discord.Interaction, task: str, duration: app_commands.Choice[int] | int = 25):
-    # Handle both Choice object (from dropdown) and raw int (typed manually)
-    if isinstance(duration, app_commands.Choice):
-        mins = duration.value
-    else:
-        mins = int(duration)
+async def pomodoro(interaction: discord.Interaction, task: str, duration: int = 25):
+    mins = int(duration)
     mins = max(1, min(mins, 300))
     await _start_session(interaction, task, "pomodoro", duration_minutes=mins)
 
@@ -2221,6 +2217,123 @@ async def syncids(interaction: discord.Interaction):
             "\n\n".join(lines) + f"\n\n*Echo counts pushed for all {len(data['members'])} operatives · {total_echoes:,} total echoes on record.*",
             color=0x10B981 if not failed else 0xF0A500
         )
+    )
+
+# ── /welcome ──────────────────────────────────────────────────────
+GROQ_API_KEY_MAIN = os.getenv("GROQ_API_KEY")
+GROQ_API_URL_MAIN = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL_MAIN   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+async def _generate_welcome_text(welcomer_name: str, new_member_name: str) -> str:
+    """Call Groq to generate a shadow-themed welcome message."""
+    if not GROQ_API_KEY_MAIN:
+        return (
+            f"*The void stirs. A new shadow joins the Order.*\n\n"
+            f"Welcome, **{new_member_name}** — the darkness has been waiting.\n"
+            f"You were brought here by **{welcomer_name}**, a trusted operative.\n\n"
+            f"The ShadowSeekers do not seek the light. We build in the dark, grind in silence, "
+            f"and emerge as something the world wasn't ready for.\n\n"
+            f"*Step in. The Order watches.*"
+        )
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY_MAIN}",
+        "Content-Type": "application/json",
+    }
+    prompt = (
+        f"Write a welcome message for a new member named '{new_member_name}' "
+        f"who was welcomed by operative '{welcomer_name}' into the ShadowSeekers Order — "
+        f"a secret society of elite, high-performance individuals who study, grind, and build in silence. "
+        f"The tone is dark, atmospheric, cinematic — like a covert society initiation. "
+        f"Reference the darkness, the void, echoes, shadows, and the grind. "
+        f"Mention both names naturally. Keep it 4–6 sentences. "
+        f"Do NOT use markdown headers. No hashtags. Just pure atmospheric prose."
+    )
+    payload = {
+        "model": GROQ_MODEL_MAIN,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are the voice of the ShadowSeekers Order — a secret society of elite operatives "
+                    "who grind in silence and build in the dark. Your welcome messages are cinematic, "
+                    "atmospheric, and feel like an initiation ritual. Dark, poetic, powerful. "
+                    "Never generic. Always specific to the names given."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.9,
+        "max_tokens": 300,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GROQ_API_URL_MAIN, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    data_r = await resp.json()
+                    return data_r["choices"][0]["message"]["content"].strip()
+                else:
+                    print(f"[WELCOME AI] Groq error {resp.status}")
+    except Exception as e:
+        print(f"[WELCOME AI] Error: {e}")
+
+    # Fallback if API fails
+    return (
+        f"*The void stirs. A new shadow joins the Order.*\n\n"
+        f"**{new_member_name}**, you were brought here by **{welcomer_name}** — and the Order does not forget a debt.\n\n"
+        f"From this moment, you grind in the dark. You build in silence. You earn your echoes.\n\n"
+        f"*Welcome to the ShadowSeekers. The darkness has been waiting.*"
+    )
+
+
+@tree.command(name="welcome", description="Welcome a new operative into the ShadowSeekers Order")
+@app_commands.describe(member="The operative to welcome into the Order")
+async def welcome(interaction: discord.Interaction, member: discord.Member):
+    if member.bot:
+        await interaction.response.send_message(
+            embed=make_embed("▲ INVALID TARGET", "You can't welcome a bot into the Order.", color=0xE63946),
+            ephemeral=True
+        )
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message(
+            embed=make_embed("▲ NICE TRY", "You cannot welcome yourself, operative.", color=0xE63946),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    welcomer_name    = interaction.user.display_name
+    new_member_name  = member.display_name
+    welcome_text     = await _generate_welcome_text(welcomer_name, new_member_name)
+
+    embed = discord.Embed(
+        description=f"🦇 *{welcome_text}*",
+        color=0x7B2FBE
+    )
+    embed.set_author(
+        name=f"☽ THE ORDER WELCOMES A NEW SHADOW",
+        icon_url=member.display_avatar.url if member.display_avatar else None
+    )
+    embed.add_field(
+        name="Welcomed by",
+        value=interaction.user.mention,
+        inline=True
+    )
+    embed.add_field(
+        name="New Operative",
+        value=member.mention,
+        inline=True
+    )
+    embed.set_thumbnail(url=member.display_avatar.url if member.display_avatar else None)
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+
+    await interaction.followup.send(
+        content=f"{interaction.user.mention} welcomes {member.mention} into the void 🦇",
+        embed=embed
     )
 
 # ── BOT EVENTS ────────────────────────────────────────────────────
