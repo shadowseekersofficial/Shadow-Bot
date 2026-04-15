@@ -609,18 +609,21 @@ async def daily_echo_task():
 
 async def _start_session(interaction: discord.Interaction, task: str, session_type: str, duration_minutes: int = None):
     """Shared logic for /study and /pomodoro."""
+    # FIX: Defer immediately — load_data() can take >3s and expire the interaction
+    await interaction.response.defer()
+
     data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
 
     if not shadow_id:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id> <n>`.", color=0xE63946)
         )
         return
 
     if uid in data["active_sessions"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ SESSION ACTIVE", "You already have an active session. Use `/endsession` to close it first.", color=0xE63946)
         )
         return
@@ -690,9 +693,8 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
     )
     embed.set_author(name=f"Operative: {codename}")
 
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    # FIX: Store the actual message object so ticker can edit it
+    # FIX: use followup.send since we deferred above; original_response() still works for message ref
+    msg = await interaction.followup.send(embed=embed, wait=True)
     _session_messages[uid] = msg
 
     # Post in focus-log channel if different
@@ -742,19 +744,22 @@ async def pomodoro(interaction: discord.Interaction, task: str, duration: int = 
     attachment="Upload a screenshot or photo as proof (renders in the embed)"
 )
 async def endsession(interaction: discord.Interaction, proof: str = None, attachment: discord.Attachment = None):
+    # FIX: Defer immediately — load_data() can expire the 3s interaction window
+    await interaction.response.defer()
+
     data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
 
     if not shadow_id:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NOT LINKED", "No Shadow ID linked.", color=0xE63946)
         )
         return
 
     sess = data["active_sessions"].get(uid)
     if not sess:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NO ACTIVE SESSION", "You don't have an active session. Start one with `/study` or `/pomodoro`.", color=0xE63946)
         )
         return
@@ -766,18 +771,16 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         except Exception:
             del data["active_sessions"][uid]
             await save_data(data)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=make_embed("▲ SESSION CORRUPTED", "Your session data was corrupted and has been cleared. Start a fresh session with `/study`.", color=0xE63946)
             )
             return
 
     if not proof and not attachment:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ PROOF REQUIRED", "Submit proof to end your session — upload an image or describe what you accomplished.", color=0xE63946)
         )
         return
-
-    await interaction.response.defer()
 
     try:
         now              = time_module.time()
@@ -1268,8 +1271,17 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 await sess_ch.send(content=member.mention, embed=dm_embed)
             return
 
-        # ── FIX: VC join ping works for ALL members (linked or not) ──
-        ping_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+        # ── FIX: VC join ping goes to the text channel in the same category as the VC ──
+        ping_ch = None
+        vc_category = after.channel.category if after.channel else None
+        if vc_category:
+            # Look for a text channel in the same category as the VC
+            ping_ch = next(
+                (ch for ch in vc_category.text_channels),
+                None
+            )
+        if not ping_ch:
+            ping_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
         if not ping_ch:
             ping_ch = discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
 
@@ -1504,6 +1516,9 @@ async def todo_list(interaction: discord.Interaction):
     lines = []
     done_weight = 0.0
     for i, t in enumerate(todos, 1):
+        # FIX: skip malformed entries that aren't dicts or are missing 'task'
+        if not isinstance(t, dict) or "task" not in t:
+            continue
         priority = t.get("priority")
         suffix   = f" {PRIORITY_EMOJI[priority]}" if priority else ""
         ops      = t.get("ops", [])
@@ -1511,7 +1526,7 @@ async def todo_list(interaction: discord.Interaction):
         if ops and all(op.get("done") for op in ops):
             t["done"] = True
 
-        if t["done"]:
+        if t.get("done"):
             lines.append(f"{DONE_EMOJI} ~~☽ {i}. {t['task']}~~{suffix}")
             done_weight += 1
         else:
