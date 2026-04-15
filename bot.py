@@ -501,13 +501,19 @@ async def session_ticker():
                 )
                 embed.set_author(name=f"Operative: {sess.get('codename', uid)}")
 
-            # Edit existing message if we have it
+            # Edit existing message if we have it, otherwise send to channel
             msg = _session_messages.get(uid)
             if msg:
                 try:
                     await msg.edit(embed=embed)
-                except:
-                    pass
+                except Exception:
+                    # Message gone — send fresh to channel and track it
+                    _session_messages.pop(uid, None)
+                    try:
+                        new_msg = await channel.send(embed=embed)
+                        _session_messages[uid] = new_msg
+                    except Exception as e:
+                        print(f"[SESSION TICKER] Could not send fresh message uid={uid}: {e}")
 
         except Exception as e:
             print(f"[SESSION TICKER ERROR] uid={uid}: {e}")
@@ -1224,6 +1230,31 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             data["active_sessions"][uid]["vc_channel"] = after.channel.name
             await save_data(data)
 
+            # Immediately force-edit the live timer message to show VC bonus
+            live_msg = _session_messages.get(uid)
+            if live_msg:
+                try:
+                    sess_snap = data["active_sessions"][uid]
+                    el        = int(now - sess_snap["start_time"])
+                    bar       = make_progress_bar(el % 3600, 3600)
+                    quick_embed = make_embed(
+                        "☽ FOCUS SESSION IN PROGRESS",
+                        f"**{sess_snap['task']}**
+
+"
+                        f"`[{bar}]` **{format_duration(el)} elapsed** · 🎙️ In VC
+
+"
+                        f"VC bonus now active — keep grinding.
+"
+                        f"Use `/endsession` to submit proof and claim echoes.",
+                        color=0xA855F7
+                    )
+                    quick_embed.set_author(name=f"Operative: {codename}")
+                    await live_msg.edit(embed=quick_embed)
+                except Exception as e:
+                    print(f"[VC JOIN] Could not edit live timer: {e}")
+
             sess        = data["active_sessions"][uid]
             elapsed     = int(now - sess["start_time"])
             pomo_end    = sess.get("pomodoro_end")
@@ -1257,15 +1288,22 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             dm_embed.set_author(name=f"Operative: {codename}")
             dm_embed.set_footer(text=f"Joined {after.channel.name} · VC bonus active")
 
-            # Ping in focus-log channel instead of DM
-            focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
-            if focus_ch:
-                await focus_ch.send(content=member.mention, embed=dm_embed)
+            # Ping in session channel or focus-log
+            sess_ch = member.guild.get_channel(int(sess["channel_id"])) if sess.get("channel_id") else None
+            if not sess_ch:
+                sess_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+            if sess_ch:
+                await sess_ch.send(content=member.mention, embed=dm_embed)
+            else:
+                print(f"[VC JOIN] No channel found to ping uid={uid}")
             return
 
-        # No active session — ping in focus-log channel
-        focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
-        if focus_ch:
+        # No active session — ping in focus-log or general channel
+        ping_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+        if not ping_ch:
+            ping_ch = discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
+        print(f"[VC JOIN] uid={uid} codename={codename} ping_ch={ping_ch}")
+        if ping_ch:
             prompt_embed = make_embed(
                 "OPERATIVE ENTERED THE VOID",
                 f"**{codename}** joined **{after.channel.name}**\n\n"
@@ -1275,7 +1313,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             )
             prompt_embed.set_author(name=f"Operative: {codename}")
             prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
-            await focus_ch.send(content=member.mention, embed=prompt_embed)
+            await ping_ch.send(content=member.mention, embed=prompt_embed)
 
     elif left:
         # Log VC time for ALL users
