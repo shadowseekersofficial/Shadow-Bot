@@ -1584,21 +1584,26 @@ async def todo_list(interaction: discord.Interaction):
     lines = []
     done_weight = 0.0
     for i, t in enumerate(todos, 1):
-        # FIX: skip malformed entries that aren't dicts or are missing 'task'
-        if not isinstance(t, dict) or "task" not in t:
+        # Handle both 'task' (manual todos) and 'text' (AI missions) keys
+        if not isinstance(t, dict):
             continue
-        priority = t.get("priority")
-        suffix   = f" {PRIORITY_EMOJI[priority]}" if priority else ""
-        ops      = t.get("ops", [])
+        task_text = t.get("task") or t.get("text")
+        if not task_text:
+            continue
+
+        priority  = t.get("priority")
+        suffix    = f" {PRIORITY_EMOJI[priority]}" if priority else ""
+        ai_badge  = " 🤖" if t.get("source") == "ai" else ""
+        ops       = t.get("ops", [])
 
         if ops and all(op.get("done") for op in ops):
             t["done"] = True
 
         if t.get("done"):
-            lines.append(f"{DONE_EMOJI} ~~☽ {i}. {t['task']}~~{suffix}")
+            lines.append(f"{DONE_EMOJI} ~~☽ {i}. {task_text}~~{suffix}{ai_badge}")
             done_weight += 1
         else:
-            lines.append(f"{UNDONE_EMOJI} {i}. {t['task']}{suffix}")
+            lines.append(f"{UNDONE_EMOJI} {i}. {task_text}{suffix}{ai_badge}")
             if ops:
                 done_ops = sum(1 for op in ops if op.get("done"))
                 done_weight += done_ops / len(ops)
