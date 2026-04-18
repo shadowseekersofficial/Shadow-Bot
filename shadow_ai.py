@@ -11,6 +11,7 @@ Features:
   - Saves plan to user profile → improves mission generation
   - Knows user's echoes, rank, session history, todos
   - Cannot be clowned, jailbroken, or broken character
+  - Conversation history persisted to GAS (survives restarts)
 """
 
 import os
@@ -27,11 +28,48 @@ GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
 GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TIMEZONE      = os.getenv("TIMEZONE", "Asia/Kolkata")
+GAS_URL       = os.getenv("GAS_WEBHOOK_URL")  # same URL used by the rest of the bot
 
 # ── Conversation history store: uid -> list of {role, content} ──
 _conversations: dict[str, list[dict]] = {}
 _last_activity: dict[str, float] = {}
-CONVO_TIMEOUT = 600  # 10 minutes of inactivity clears history
+CONVO_TIMEOUT = 600  # 10 minutes of inactivity → flush RAM, history lives in GAS
+
+
+# ── GAS PERSISTENCE ───────────────────────────────────────────────
+
+async def gas_save(uid: str, messages: list[dict]):
+    """Push conversation history to GAS (fire-and-forget)."""
+    if not GAS_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                GAS_URL,
+                json={"action": "saveConvo", "uid": uid, "messages": messages},
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+    except Exception as e:
+        print(f"[SHADOW AI] GAS save failed uid={uid}: {e}")
+
+
+async def gas_load(uid: str) -> list[dict]:
+    """Pull conversation history from GAS for this user."""
+    if not GAS_URL:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                GAS_URL,
+                params={"action": "loadConvo", "uid": uid},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                return data.get("messages", [])
+    except Exception as e:
+        print(f"[SHADOW AI] GAS load failed uid={uid}: {e}")
+        return []
+
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────
 SHADOW_SYSTEM_PROMPT = """You are SHADOW — the intelligence core of the ShadowSeekers Order.
@@ -209,8 +247,10 @@ async def handle_mention(message: discord.Message, bot: discord.Client, load_dat
     if not content:
         content = "..."
 
-    # Clear stale conversation after timeout
+    # On timeout — save to GAS before clearing RAM
     if uid in _last_activity and (now - _last_activity[uid]) > CONVO_TIMEOUT:
+        if uid in _conversations:
+            asyncio.create_task(gas_save(uid, _conversations[uid]))
         _conversations.pop(uid, None)
 
     _last_activity[uid] = now
@@ -219,18 +259,22 @@ async def handle_mention(message: discord.Message, bot: discord.Client, load_dat
     data = await load_data_fn()
     context = build_operative_context(uid, data, message.author)
 
-    # Build message history for this conversation
+    # Restore from GAS if not in RAM (bot restart or after timeout)
     if uid not in _conversations:
-        # Fresh conversation — inject context as first system message
+        restored = await gas_load(uid)
+        convo_msgs = [m for m in restored if m["role"] != "system"]
+        if convo_msgs:
+            print(f"[SHADOW AI] Restored {len(convo_msgs)} messages for uid={uid} from GAS")
         _conversations[uid] = [
             {"role": "system", "content": SHADOW_SYSTEM_PROMPT},
-            {"role": "system", "content": context},
+            {"role": "system", "content": context},  # always fresh — operative data may have changed
+            *convo_msgs,
         ]
 
     # Add user message
     _conversations[uid].append({"role": "user", "content": content})
 
-    # Keep history bounded — max 20 exchanges (40 messages + 2 system)
+    # Keep history bounded — max 40 exchanges (+ 2 system)
     system_msgs = [m for m in _conversations[uid] if m["role"] == "system"]
     convo_msgs  = [m for m in _conversations[uid] if m["role"] != "system"]
     if len(convo_msgs) > 40:
@@ -247,6 +291,9 @@ async def handle_mention(message: discord.Message, bot: discord.Client, load_dat
 
     # Add assistant response to history
     _conversations[uid].append({"role": "assistant", "content": response})
+
+    # Push updated history to GAS (fire-and-forget)
+    asyncio.create_task(gas_save(uid, _conversations[uid]))
 
     # Check if response contains a plan to save
     plan_saved = False
