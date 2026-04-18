@@ -52,7 +52,11 @@ import motor.motor_asyncio
 import time as time_module
 import re
 from ai_missions import setup_ai_missions, ai_mission_task
-from shadow_ai import handle_mention, setup_shadow_ai
+from shadow_ai import (
+    handle_mention, setup_shadow_ai,
+    ensure_plan_ttl_index, gas_set_tokens, gas_get_tokens,
+    STARTING_TOKENS, LINKED_BONUS,
+)
 
 # ── CONFIG ────────────────────────────────────────────────────────
 TOKEN        = os.getenv("DISCORD_TOKEN")
@@ -2998,6 +3002,242 @@ async def ask_ai(interaction: discord.Interaction, question: str):
         )
 
 
+# ══════════════════════════════════════════════════════════════════
+#  /plan — Operative Plan Commands
+# ══════════════════════════════════════════════════════════════════
+
+plan_group = app_commands.Group(name="plan", description="Manage your operative plan")
+tree.add_command(plan_group)
+
+
+@plan_group.command(name="new", description="Start building a new operative plan with SHADOW")
+async def plan_new(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    data = await load_data()
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link`.", color=0xE63946))
+        return
+
+    from shadow_ai import start_plan_new
+
+    # We need a fake message-like object pointing to the right channel
+    class _FakeMsg:
+        author = interaction.user
+        channel = interaction.channel
+
+    await interaction.followup.send(embed=make_embed("◈ PLAN PROTOCOL", "Initiating plan-building sequence. Respond in this channel.", color=0x7B2FBE))
+    await start_plan_new(_FakeMsg(), load_data, get_db)
+
+
+@plan_group.command(name="view", description="View your current operative plan")
+async def plan_view(interaction: discord.Interaction):
+    await interaction.response.defer()
+    uid = str(interaction.user.id)
+    data = await load_data()
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
+        return
+
+    from shadow_ai import get_plan
+    plan = await get_plan(uid, get_db)
+    if not plan:
+        await interaction.followup.send(embed=make_embed("▲ NO PLAN", "No operative plan on file. Use `/plan new` to create one.", color=0xE63946))
+        return
+
+    embed = make_embed("☽ OPERATIVE PLAN", plan.get("plan_text", "No details."), color=0x7B2FBE)
+    embed.add_field(name="Goal", value=plan.get("goal", "—"), inline=True)
+    embed.add_field(name="Timeline", value=plan.get("timeline", "—"), inline=True)
+    embed.add_field(name="Hours/Day", value=str(plan.get("hours_per_day", "—")), inline=True)
+    subjects = plan.get("subjects", [])
+    if subjects:
+        embed.add_field(name="Subjects", value=" · ".join(subjects), inline=False)
+    created = plan.get("created_at", "")
+    if created:
+        embed.set_footer(text=f"Plan locked: {created[:10]}")
+    await interaction.followup.send(embed=embed)
+
+
+@plan_group.command(name="revise", description="Revise your existing operative plan with SHADOW")
+async def plan_revise(interaction: discord.Interaction):
+    await interaction.response.defer()
+    uid = str(interaction.user.id)
+    data = await load_data()
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
+        return
+
+    from shadow_ai import start_plan_revise
+
+    class _FakeMsg:
+        author = interaction.user
+        channel = interaction.channel
+
+    await interaction.followup.send(embed=make_embed("◈ PLAN REVISION", "Loading your plan. Respond in this channel.", color=0x7B2FBE))
+    await start_plan_revise(_FakeMsg(), load_data, get_db)
+
+
+@plan_group.command(name="delete", description="Delete your operative plan permanently")
+async def plan_delete(interaction: discord.Interaction):
+    await interaction.response.defer()
+    uid = str(interaction.user.id)
+    data = await load_data()
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
+        return
+
+    from shadow_ai import gas_delete_plan, mongo_delete_plan_cache, get_plan
+    plan = await get_plan(uid, get_db)
+    if not plan:
+        await interaction.followup.send(embed=make_embed("▲ NO PLAN", "No plan on file to delete.", color=0xE63946))
+        return
+
+    await gas_delete_plan(uid)
+    await mongo_delete_plan_cache(uid, get_db)
+    await interaction.followup.send(embed=make_embed("◈ PLAN DELETED", "Operative plan has been wiped from the records.", color=0x10B981))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /newchat — Reset AI conversation history
+# ══════════════════════════════════════════════════════════════════
+
+@tree.command(name="newchat", description="Clear your SHADOW conversation history and start fresh")
+async def newchat(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    from shadow_ai import clear_user_chat
+    await clear_user_chat(uid)
+    await interaction.followup.send(
+        embed=make_embed(
+            "◈ MEMORY WIPED",
+            "Conversation history cleared. SHADOW still knows your rank, echoes, and objectives — just not what you were talking about.",
+            color=0x10B981,
+        ),
+        ephemeral=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /token — Shadow Token management
+# ══════════════════════════════════════════════════════════════════
+
+TOKEN_TIERS = [
+    {"tokens": 50,  "echoes": 100},
+    {"tokens": 150, "echoes": 250},
+    {"tokens": 500, "echoes": 700},
+]
+
+
+class TokenTierView(discord.ui.View):
+    def __init__(self, uid: str, member_data: dict, current_tokens: int, echo_count: int):
+        super().__init__(timeout=60)
+        self.uid = uid
+        self.member_data = member_data
+        self.current_tokens = current_tokens
+        self.echo_count = echo_count
+
+        for tier in TOKEN_TIERS:
+            can_afford = echo_count >= tier["echoes"]
+            btn = discord.ui.Button(
+                label=f"+{tier['tokens']} tokens — {tier['echoes']} echoes",
+                style=discord.ButtonStyle.green if can_afford else discord.ButtonStyle.gray,
+                disabled=not can_afford,
+                custom_id=f"token_{tier['tokens']}_{tier['echoes']}",
+            )
+            btn.callback = self._make_callback(tier)
+            self.add_item(btn)
+
+    def _make_callback(self, tier: dict):
+        async def callback(interaction: discord.Interaction):
+            if str(interaction.user.id) != self.uid:
+                await interaction.response.send_message("This isn't your token menu.", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+
+            from shadow_ai import gas_get_tokens, gas_set_tokens
+            # Re-fetch live echo count
+            data = await load_data()
+            uid = self.uid
+            shadow_id = get_shadow_id(uid, data)
+            member = get_member(shadow_id, data) if shadow_id else None
+            if not member:
+                await interaction.followup.send("Member data not found.", ephemeral=True)
+                return
+
+            echo_count = int(member.get("echoCount", 0))
+            if echo_count < tier["echoes"]:
+                await interaction.followup.send(
+                    embed=make_embed("▲ INSUFFICIENT ECHOES", f"You need {tier['echoes']} echoes. You have {echo_count}.", color=0xE63946),
+                    ephemeral=True,
+                )
+                return
+
+            # Deduct echoes
+            member["echoCount"] = str(echo_count - tier["echoes"])
+            await save_data(data)
+            await push_to_gas(data)
+
+            # Add tokens
+            current = await gas_get_tokens(uid) or 0
+            new_total = current + tier["tokens"]
+            await gas_set_tokens(uid, new_total)
+
+            embed = make_embed(
+                "◈ TOKENS ACQUIRED",
+                f"**+{tier['tokens']} shadow tokens** added to your reserves.\n\n"
+                f"◈ Token balance: **{new_total}**\n"
+                f"☽ Echo balance: **{echo_count - tier['echoes']}**",
+                color=0x10B981,
+            )
+            await interaction.followup.send(embed=embed)
+            for child in self.children:
+                child.disabled = True
+            self.stop()
+
+        return callback
+
+
+@tree.command(name="token", description="View your shadow token balance or purchase more")
+async def token_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    uid = str(interaction.user.id)
+    data = await load_data()
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
+        return
+
+    member = get_member(shadow_id, data)
+    if not member:
+        await interaction.followup.send(embed=make_embed("▲ NOT FOUND", "Member data not found.", color=0xE63946))
+        return
+
+    echo_count = int(member.get("echoCount", 0))
+
+    from shadow_ai import get_tokens
+    current_tokens = await get_tokens(uid)
+
+    embed = make_embed(
+        "☽ SHADOW TOKEN RESERVES",
+        f"**Token balance:** {current_tokens} tokens\n"
+        f"**Echo balance:** {echo_count} echoes\n\n"
+        f"Each @ mention with SHADOW costs **1 token**.\n"
+        f"Select a tier below to restock:",
+        color=0x7B2FBE,
+    )
+    embed.add_field(name="Tier I",   value="50 tokens — 100 echoes",  inline=True)
+    embed.add_field(name="Tier II",  value="150 tokens — 250 echoes", inline=True)
+    embed.add_field(name="Tier III", value="500 tokens — 700 echoes", inline=True)
+
+    view = TokenTierView(uid, member, current_tokens, echo_count)
+    await interaction.followup.send(embed=embed, view=view)
+
+
 # ── BOT EVENTS ────────────────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
@@ -3005,7 +3245,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if bot.user in message.mentions:
-        await handle_mention(message, bot, load_data, save_data)
+        await handle_mention(message, bot, load_data, save_data, get_db)
     await bot.process_commands(message)
 
 
@@ -3030,6 +3270,20 @@ async def on_ready():
     await pull_from_gas(data)
     loaded = await load_data()
     print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from GAS")
+
+    # Ensure MongoDB TTL index for plan_cache (15 min expiry)
+    await ensure_plan_ttl_index(get_db)
+
+    # Seed shadow tokens for existing linked members who don't have any yet
+    try:
+        for uid, link in loaded.get("links", {}).items():
+            if link.get("approved"):
+                existing = await gas_get_tokens(uid)
+                if existing is None:
+                    await gas_set_tokens(uid, LINKED_BONUS)
+                    print(f"[TOKENS] Seeded {LINKED_BONUS} tokens for existing member uid={uid}")
+    except Exception as e:
+        print(f"[TOKENS] Seeding error: {e}")
 
     # Purge any leftover grind boards from before the restart
     for guild in bot.guilds:
