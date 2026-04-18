@@ -149,15 +149,17 @@ Current Rank Tier: {tier_name}
 Objective History (last 7 days):
 {history_block}
 
-Based on this history, generate 3 to 5 personalized daily missions for today.
-Rules:
-- Each mission must be a single clear, actionable sentence (not a vague goal)
-- Missions should reflect patterns in their history — if they study, give study tasks; if they train, give fitness tasks
-- Scale difficulty to their rank: {tier_name}s should be challenged harder than Initiates
-- If they failed tasks frequently, give fewer but more achievable missions to rebuild momentum
-- If they completed everything, push them harder today
-- Do NOT add explanations, headers, or numbering — just output one mission per line, nothing else
-- Output ONLY the missions, one per line, no bullets, no numbers, no extra text
+Generate 3 to 5 personalized daily missions for today based STRICTLY on this operative's history.
+Critical rules:
+- Look at what subjects/topics they actually study — generate missions in THOSE exact areas only
+- If they study math, give math tasks. If they code, give coding tasks. Mirror their actual work.
+- Each mission must name a specific topic, chapter, or skill — never generic phrases
+- Example good mission: "Complete 20 integration problems from Chapter 5"
+- Example bad mission: "Work on your studies" or "Complete your daily tasks"
+- If no history exists, generate general productivity missions (pomodoro sessions, revision, planning)
+- Scale difficulty to rank: {tier_name}
+- If they failed frequently, give 3 easier missions. If they completed everything, give 5 harder ones.
+- Output ONLY the missions, one per line, no bullets, no numbers, no extra text, nothing else
 """.strip()
 
     return prompt
@@ -342,8 +344,9 @@ async def ai_mission_task():
 def register_commands(tree: app_commands.CommandTree):
     """Register all AI mission slash commands onto the bot's command tree."""
 
-    @tree.command(name="acceptmissions", description="Deploy today's AI-generated missions to your dossier")
-    async def acceptmissions(interaction: discord.Interaction):
+    @tree.command(name="acceptmissions", description="Deploy today's AI missions to your dossier (e.g. all, or pick: 1,3,5)")
+    @app_commands.describe(numbers="Which missions to accept: 'all' or comma-separated numbers like '1,3,5'")
+    async def acceptmissions(interaction: discord.Interaction, numbers: str = "all"):
         uid = str(interaction.user.id)
 
         missions = _pending_missions.get(uid)
@@ -360,6 +363,33 @@ def register_commands(tree: app_commands.CommandTree):
                 ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE")
             )
             return
+
+        # ── Parse which missions to accept ──
+        if numbers.strip().lower() == "all":
+            selected = missions
+        else:
+            try:
+                indices = [int(x.strip()) for x in numbers.split(",")]
+                invalid = [n for n in indices if n < 1 or n > len(missions)]
+                if invalid:
+                    await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title="▲ INVALID NUMBERS",
+                            description=f"Mission numbers {', '.join(str(n) for n in invalid)} don't exist. You have {len(missions)} missions. Use `/mymissions` to see them.",
+                            color=0xE63946
+                        )
+                    )
+                    return
+                selected = [missions[i - 1] for i in indices]
+            except ValueError:
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="▲ INVALID INPUT",
+                        description="Use `all` or comma-separated numbers like `1,3,5`.",
+                        color=0xE63946
+                    )
+                )
+                return
 
         # Import set_todos_for_date and helpers from main bot
         try:
@@ -405,22 +435,23 @@ def register_commands(tree: app_commands.CommandTree):
                 "priority": "p2",  # default priority for AI missions
                 "source":   "ai",  # tag so they're identifiable
             }
-            for mission in missions
+            for mission in selected
         ]
 
         updated = existing + new_todos
         set_todos_for_date(uid, today, updated, data)
         await save_data(data)
 
-        # Clear pending so they can't double-add
-        del _pending_missions[uid]
+        # Clear pending only if all missions were accepted
+        if len(selected) == len(missions):
+            del _pending_missions[uid]
 
-        mission_lines = "\n".join(f"◈ {m}" for m in missions)
+        mission_lines = "\n".join(f"◈ {m}" for m in selected)
 
         await interaction.response.send_message(
             embed=make_embed(
                 "✅ MISSIONS DEPLOYED",
-                f"**{len(missions)} AI missions** have been added to your dossier for today:\n\n"
+                f"**{len(selected)} AI mission{'s' if len(selected) != 1 else ''}** added to your dossier:\n\n"
                 f"{mission_lines}\n\n"
                 f"View with `/todo list`.",
                 color=0x10B981
