@@ -3434,8 +3434,14 @@ async def on_ready():
     )
 
     try:
+        # Clear guild-specific commands on all guilds first (removes duplicates from previous deploy)
+        for guild in bot.guilds:
+            tree.clear_commands(guild=guild)
+            await tree.sync(guild=guild)
+            print(f"[SHADOW BOT] Cleared guild commands: {guild.name}")
+        # Then do the global sync
         synced = await tree.sync()
-        print(f"[SHADOW BOT] Synced {len(synced)} slash commands")
+        print(f"[SHADOW BOT] Synced {len(synced)} slash commands globally")
     except Exception as e:
         print(f"[SHADOW BOT] Sync error: {e}")
 
