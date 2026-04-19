@@ -643,3 +643,781 @@ async def handle_mention(
 def setup_shadow_ai(bot_instance):
     """Called from on_ready in bot.py"""
     print("[SHADOW AI] Shadow AI chat engine ready ✓")
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# ☽  GHOST GUIDE — AI-powered new member onboarding
+#    • on_member_join  → welcome embed in #general + DM intro
+#    • DM replies      → Ghost answers questions about the server
+#    • /train          → admin-only AI interview → saves to MongoDB
+#    • /setwelcome     → admins customize the general channel message
+# ══════════════════════════════════════════════════════════════════
+
+# ── In-memory state ───────────────────────────────────────────────
+# Ghost onboarding sessions: uid -> {"active": bool, "history": [...]}
+_ghost_sessions: dict[str, dict] = {}
+
+# Train sessions: uid -> {"active": bool, "history": [...], "pending": {...}}
+_train_sessions: dict[str, dict] = {}
+
+GHOST_KNOWLEDGE_COLLECTION = "ghost_knowledge"
+GHOST_CONFIG_COLLECTION    = "ghost_config"
+
+
+# ══════════════════════════════════════════════════════════════════
+# MONGODB HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+async def ghost_load_knowledge(get_db_fn) -> str:
+    """
+    Pull all docs from ghost_knowledge and return as a single context block.
+    Admins build this via /train. Each doc:
+      { "_id": "rules", "title": "Server Rules", "content": "..." }
+    """
+    db = get_db_fn()
+    if db is None:
+        return _GHOST_FALLBACK_KNOWLEDGE
+    try:
+        docs = await db[GHOST_KNOWLEDGE_COLLECTION].find({}).to_list(length=100)
+        if not docs:
+            return _GHOST_FALLBACK_KNOWLEDGE
+        sections = []
+        for doc in sorted(docs, key=lambda d: d.get("order", 99)):
+            title   = doc.get("title", str(doc["_id"]).upper())
+            content = doc.get("content", "")
+            if content:
+                sections.append(f"=== {title} ===\n{content}")
+        return "\n\n".join(sections) if sections else _GHOST_FALLBACK_KNOWLEDGE
+    except Exception as e:
+        print(f"[GHOST] Knowledge load failed: {e}")
+        return _GHOST_FALLBACK_KNOWLEDGE
+
+
+async def ghost_save_knowledge_doc(get_db_fn, doc_id: str, title: str, content: str, order: int = 99):
+    """Upsert a knowledge document into MongoDB."""
+    db = get_db_fn()
+    if db is None:
+        return False
+    try:
+        await db[GHOST_KNOWLEDGE_COLLECTION].update_one(
+            {"_id": doc_id},
+            {"$set": {"title": title, "content": content, "order": order}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[GHOST] Knowledge save failed: {e}")
+        return False
+
+
+async def ghost_delete_knowledge_doc(get_db_fn, doc_id: str) -> bool:
+    db = get_db_fn()
+    if db is None:
+        return False
+    try:
+        result = await db[GHOST_KNOWLEDGE_COLLECTION].delete_one({"_id": doc_id})
+        return result.deleted_count > 0
+    except Exception as e:
+        print(f"[GHOST] Knowledge delete failed: {e}")
+        return False
+
+
+async def ghost_list_knowledge_docs(get_db_fn) -> list[dict]:
+    db = get_db_fn()
+    if db is None:
+        return []
+    try:
+        return await db[GHOST_KNOWLEDGE_COLLECTION].find(
+            {}, {"_id": 1, "title": 1, "order": 1}
+        ).to_list(length=100)
+    except Exception as e:
+        print(f"[GHOST] Knowledge list failed: {e}")
+        return []
+
+
+async def ghost_load_config(get_db_fn) -> dict:
+    """Load ghost_config doc — stores welcome message template etc."""
+    db = get_db_fn()
+    if db is None:
+        return {}
+    try:
+        doc = await db[GHOST_CONFIG_COLLECTION].find_one({"_id": "welcome"}) or {}
+        return doc
+    except Exception as e:
+        print(f"[GHOST] Config load failed: {e}")
+        return {}
+
+
+async def ghost_save_config(get_db_fn, key: str, value):
+    db = get_db_fn()
+    if db is None:
+        return False
+    try:
+        await db[GHOST_CONFIG_COLLECTION].update_one(
+            {"_id": "welcome"},
+            {"$set": {key: value}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[GHOST] Config save failed: {e}")
+        return False
+
+
+# ── Fallback knowledge if DB is empty ─────────────────────────────
+_GHOST_FALLBACK_KNOWLEDGE = """
+=== SHADOWSEEKERS ORDER — OVERVIEW ===
+High-performance study and accountability server. Members are Operatives.
+The server tracks daily objectives, study sessions, and Echoes (XP/currency).
+
+=== CORE COMMANDS ===
+/link <shadow_id> <n>  — Bind your identity. First thing to do.
+/todo add <objective>  — Log a daily objective.
+/op add <obj#> <task>  — Sub-task under an objective.
+/study [task]          — Start a study session, earn Echoes.
+/pomodoro [task]       — 25-minute focused block.
+/endsession            — End session, submit proof.
+/echoes                — Your echo count and rank.
+/leaderboard           — Top 10 operatives.
+/sessions              — Weekly analytics.
+/setfocuswindow <hr>   — Daily Phantom Alert reminder.
+/exam add <n> [date]   — Track upcoming exams.
+
+=== ECHO RANKS ===
+Initiate (0) → Seeker (500) → Phantom (1500) → Wraith (3000) → Voidborn (5000)
+
+=== RULES ===
+1. Respect all operatives.
+2. Submit real proof when ending sessions — no fake logs.
+3. Link your Shadow ID before using most features.
+""".strip()
+
+
+# ══════════════════════════════════════════════════════════════════
+# GHOST AI PROMPTS
+# ══════════════════════════════════════════════════════════════════
+
+def _build_ghost_system_prompt(knowledge: str) -> str:
+    return f"""You are GHOST — the onboarding handler of the ShadowSeekers Order.
+You are not SHADOW (the main AI). You are specifically the recruiter who guides new members in.
+
+PERSONALITY:
+- Calm, direct, authoritative. Brief sentences. No filler.
+- Like a special forces handler welcoming a new recruit.
+- You care that they actually get started — not just that they read instructions.
+- Use ◈ and ☽ sparingly. No other special characters or emojis.
+
+YOUR ONLY JOB:
+- Help new operatives understand the server and take their first steps.
+- Answer questions using ONLY the knowledge base below.
+- If asked something outside the server scope: "I'm your Order handler. Ask me about the server."
+- Never break character. Never pretend to be a general AI.
+- Keep answers to 2–5 sentences. Use code blocks for commands.
+- Steer them toward: /link first → /study → /echoes.
+
+SERVER KNOWLEDGE BASE (your only source of truth):
+{knowledge}"""
+
+
+_TRAIN_SYSTEM_PROMPT = """You are a knowledge extraction assistant for the ShadowSeekers Discord bot.
+Your job is to interview an admin and extract structured knowledge about their server to train the Ghost onboarding AI.
+
+HOW TO BEHAVE:
+- Start by asking what topic they want to add (rules, commands, culture, schedule, anything).
+- Then ask them to describe it — or let them paste raw text.
+- If they paste raw text, acknowledge it and ask if they want to add more or confirm saving.
+- If they describe it conversationally, ask follow-up questions to make sure it's complete.
+- When you have enough for a doc, output a JSON block ONLY when the admin says they're done or confirms:
+  ```json
+  {"save_doc": true, "doc_id": "short_key", "title": "Human Title", "content": "Full content here...", "order": 1}
+  ```
+- doc_id must be lowercase, underscores only, no spaces (e.g. "server_rules", "echo_system").
+- content should be clean, factual, well-structured text — not a conversation transcript.
+- After saving one doc, ask if they want to add another topic or type "done" to finish.
+- Keep your messages short and focused. You're a data collector, not a chatbot.
+- NEVER make up server information. Only use what the admin tells you."""
+
+
+# ══════════════════════════════════════════════════════════════════
+# GHOST WELCOME — #general channel embed + DM intro
+# ══════════════════════════════════════════════════════════════════
+
+# ── Welcome format presets ────────────────────────────────────────
+# Admins pick one via /setwelcome format <1-4>
+# The AI writes within the chosen style/tone.
+WELCOME_FORMATS = {
+    "1": {
+        "name":        "Operative Briefing",
+        "tone":        "Cold, military handler tone. Like receiving classified orders. Serious and atmospheric.",
+        "structure":   "One punchy line welcoming them by name. One sentence about the Order. One line: their first order is /link. Sign off with '— Ghost'.",
+        "title_style": "◈ OPERATIVE {name} — IDENTITY UNCONFIRMED",
+    },
+    "2": {
+        "name":        "Shadow Initiation",
+        "tone":        "Mystical, dark, poetic. Like being inducted into a secret society.",
+        "structure":   "Open with a short dramatic line about them stepping into the dark. Mention the Order and what it stands for. Tell them /link is their first rite. End with a cryptic closer.",
+        "title_style": "☽ THE ORDER STIRS — {name} HAS ARRIVED",
+    },
+    "3": {
+        "name":        "Grind Culture",
+        "tone":        "Hype, motivational, focused on the grind and echoes. Energy of a training montage.",
+        "structure":   "Hype them up by name. One line about the grind culture of the server. Tell them to /link and get after it. Short and punchy.",
+        "title_style": "⚡ {name} JUST DROPPED IN",
+    },
+    "4": {
+        "name":        "Ghost Intel Drop",
+        "tone":        "Like receiving a mission briefing. Factual, intel-style, slightly mysterious.",
+        "structure":   "Brief them: new operative name detected. State the Order's mission in one sentence. List their immediate objectives: 1) /link 2) /study 3) /echoes. End with 'Standing by.'",
+        "title_style": "◈ INTEL DROP — {name}",
+    },
+}
+
+_WELCOME_AI_SYSTEM = """You are Ghost, the onboarding handler of the ShadowSeekers Order.
+Your job right now is to write the #general channel welcome message for a new member.
+Write ONLY the embed description text — no titles, no headers, no markdown headers with ##.
+Keep it under 80 words. Use ◈ or ☽ at most once. No emojis.
+Write exactly in the tone and structure the admin has configured."""
+
+
+async def _generate_welcome_text(
+    member: discord.Member,
+    guild: discord.Guild,
+    knowledge: str,
+    config: dict,
+) -> str:
+    """Ask the AI to write the #general welcome description."""
+
+    fmt_id   = config.get("welcome_format", "1")
+    fmt      = WELCOME_FORMATS.get(str(fmt_id), WELCOME_FORMATS["1"])
+    tone_override = config.get("welcome_tone_override", "")  # admin can add extra instructions
+
+    member_count = guild.member_count or "?"
+    server_name  = guild.name
+
+    # Pull a 2-sentence summary from knowledge for context
+    knowledge_snippet = knowledge[:600] if knowledge else "A high-performance study and accountability server."
+
+    prompt = (
+        f"Write a #general welcome message for a new member.\n\n"
+        f"Member name: {member.display_name}\n"
+        f"Server name: {server_name}\n"
+        f"Member count: {member_count}\n\n"
+        f"TONE: {fmt['tone']}\n"
+        f"STRUCTURE: {fmt['structure']}\n"
+        f"{'EXTRA ADMIN INSTRUCTIONS: ' + tone_override if tone_override else ''}\n\n"
+        f"SERVER CONTEXT (use naturally, don't quote verbatim):\n{knowledge_snippet}\n\n"
+        f"Write only the embed body text. Under 80 words."
+    )
+
+    messages = [
+        {"role": "system", "content": _WELCOME_AI_SYSTEM},
+        {"role": "user",   "content": prompt},
+    ]
+
+    response = await call_shadow_ai(messages)
+    return response or (
+        f"The Order grows stronger, {member.display_name}.\n\n"
+        "Your first move: `/link` your Shadow ID.\nThen — log objectives, run sessions, earn echoes.\n"
+        "Check your DMs. Ghost is standing by."
+    )
+
+
+async def ghost_send_welcome(member: discord.Member, get_db_fn, bot_instance):
+    """
+    Called from on_member_join.
+    1. Posts an AI-generated welcome embed in #general
+    2. Sends an AI-generated intro DM and opens a ghost session
+    Both run concurrently.
+    """
+    guild    = member.guild
+    config   = await ghost_load_config(get_db_fn)
+    knowledge = await ghost_load_knowledge(get_db_fn)
+
+    # Run both concurrently
+    await asyncio.gather(
+        _ghost_general_welcome(member, guild, config, knowledge),
+        _ghost_send_dm_intro(member, knowledge),
+    )
+
+
+async def _ghost_general_welcome(
+    member: discord.Member,
+    guild: discord.Guild,
+    config: dict,
+    knowledge: str,
+):
+    """AI-generated welcome embed posted in #general."""
+    gen_ch_name = os.getenv("GENERAL_CHANNEL", "general")
+    general_ch  = discord.utils.get(guild.text_channels, name=gen_ch_name)
+    if not general_ch:
+        return
+
+    # ── Generate AI text ──────────────────────────────────────────
+    ai_text = await _generate_welcome_text(member, guild, knowledge, config)
+
+    # ── Build embed ───────────────────────────────────────────────
+    fmt_id    = config.get("welcome_format", "1")
+    fmt       = WELCOME_FORMATS.get(str(fmt_id), WELCOME_FORMATS["1"])
+    color_hex = config.get("welcome_color", "7B2FBE")
+    banner    = config.get("welcome_banner")
+
+    try:
+        color = int(color_hex.lstrip("#"), 16)
+    except Exception:
+        color = 0x7B2FBE
+
+    # Title uses the format's template with member name
+    raw_title = fmt["title_style"].format(name=member.display_name.upper())
+    # Admin can override title entirely
+    title = config.get("welcome_title_override") or raw_title
+
+    embed = discord.Embed(
+        title=title,
+        description=f"{member.mention}\n\n{ai_text}",
+        color=color,
+    )
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+
+    # Member avatar as thumbnail
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    # Server icon as author icon
+    if guild.icon:
+        embed.set_author(name=guild.name, icon_url=guild.icon.url)
+
+    # Optional banner
+    if banner:
+        embed.set_image(url=banner)
+
+    try:
+        await general_ch.send(embed=embed)
+        print(f"[GHOST] General welcome posted for {member} (format {fmt_id})")
+    except Exception as e:
+        print(f"[GHOST] General welcome failed: {e}")
+
+
+async def _ghost_send_dm_intro(member: discord.Member, knowledge: str):
+    """AI-generated DM introducing Ghost and explaining the server."""
+    uid    = str(member.id)
+    system = _build_ghost_system_prompt(knowledge)
+
+    intro_prompt = (
+        f"New recruit '{member.display_name}' just joined. Send them a sharp intro DM as Ghost. "
+        "Tell them: (1) what the ShadowSeekers Order is in 1-2 sentences, "
+        "(2) that you're Ghost, their onboarding handler — not Shadow, "
+        "(3) their very first step is /link, "
+        "(4) invite them to reply here with any questions. "
+        "Under 100 words. No headers. Speak directly to them."
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": intro_prompt},
+    ]
+
+    response = await call_shadow_ai(messages)
+    if not response:
+        response = (
+            f"☽ Welcome to the ShadowSeekers Order, {member.display_name}.\n\n"
+            "I'm Ghost — your onboarding handler. "
+            "Your first move is `/link <shadow_id> <n>` in the server to bind your identity.\n\n"
+            "Reply here if you have questions. Standing by."
+        )
+
+    _ghost_sessions[uid] = {
+        "active": True,
+        "history": [
+            {"role": "system",    "content": system},
+            {"role": "assistant", "content": response},
+        ],
+    }
+
+    try:
+        embed = discord.Embed(description=response, color=0x7B2FBE)
+        embed.set_author(name="☽ GHOST · ShadowSeekers Handler")
+        embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+        await member.send(embed=embed)
+        print(f"[GHOST] DM intro sent to {member} ({uid})")
+    except discord.Forbidden:
+        print(f"[GHOST] DMs closed for {member} ({uid}) — skipping DM intro")
+        _ghost_sessions.pop(uid, None)
+
+
+# ══════════════════════════════════════════════════════════════════
+# GHOST DM REPLY HANDLER
+# ══════════════════════════════════════════════════════════════════
+
+async def ghost_handle_dm(message: discord.Message, get_db_fn) -> bool:
+    """
+    Called from on_message for DMs. Continues onboarding conversation.
+    Returns True if handled, False if not a ghost session.
+    """
+    uid     = str(message.author.id)
+    session = _ghost_sessions.get(uid)
+    if not session or not session["active"]:
+        return False
+
+    content = message.content.strip()
+    if not content:
+        return True
+
+    session["history"].append({"role": "user", "content": content})
+
+    # Cap history
+    sys_msgs   = [m for m in session["history"] if m["role"] == "system"]
+    convo_msgs = [m for m in session["history"] if m["role"] != "system"]
+    if len(convo_msgs) > 20:
+        convo_msgs = convo_msgs[-20:]
+    session["history"] = sys_msgs + convo_msgs
+
+    async with message.channel.typing():
+        response = await call_shadow_ai(session["history"])
+
+    if not response:
+        response = "*Signal lost. Try again, Operative.*"
+
+    session["history"].append({"role": "assistant", "content": response})
+
+    embed = discord.Embed(description=response, color=0x7B2FBE)
+    embed.set_author(name="☽ GHOST · ShadowSeekers Handler")
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+    await message.channel.send(embed=embed)
+    return True
+
+
+def ghost_is_active(uid: str) -> bool:
+    sess = _ghost_sessions.get(uid)
+    return bool(sess and sess["active"])
+
+
+def ghost_close_session(uid: str):
+    _ghost_sessions.pop(uid, None)
+
+
+# ══════════════════════════════════════════════════════════════════
+# /TRAIN — ADMIN KNOWLEDGE BUILDER
+# ══════════════════════════════════════════════════════════════════
+
+async def train_start(interaction: discord.Interaction, get_db_fn):
+    """Start a /train session — AI interviews the admin to build knowledge docs."""
+    uid = str(interaction.user.id)
+
+    # Kick off fresh train session
+    _train_sessions[uid] = {
+        "active":  True,
+        "history": [
+            {"role": "system", "content": _TRAIN_SYSTEM_PROMPT},
+        ],
+        "get_db_fn": get_db_fn,
+    }
+
+    opener_prompt = "Begin the interview. Ask the admin what topic they want to add to the Ghost knowledge base."
+    _train_sessions[uid]["history"].append({"role": "user", "content": opener_prompt})
+
+    async with interaction.channel.typing():
+        response = await call_shadow_ai(_train_sessions[uid]["history"])
+
+    if not response:
+        response = "What topic do you want to add to Ghost's knowledge base? (e.g. server rules, echo system, culture)"
+
+    _train_sessions[uid]["history"].append({"role": "assistant", "content": response})
+
+    embed = discord.Embed(
+        title="◈ GHOST TRAINING SESSION INITIATED",
+        description=response,
+        color=0xA855F7,
+    )
+    embed.set_footer(text="Type your answers here · Type 'done' to end the session · /train stop to cancel")
+    await interaction.response.send_message(embed=embed)
+
+
+async def train_handle_message(message: discord.Message, get_db_fn) -> bool:
+    """
+    Called from on_message for channel messages during an active /train session.
+    Returns True if handled.
+    """
+    uid     = str(message.author.id)
+    session = _train_sessions.get(uid)
+    if not session or not session["active"]:
+        return False
+
+    content = message.content.strip()
+    if not content:
+        return True
+
+    # "done" → end session
+    if content.lower() in ("done", "/done", "exit", "/train stop"):
+        _train_sessions.pop(uid, None)
+        embed = discord.Embed(
+            title="◈ TRAINING SESSION CLOSED",
+            description="Ghost's knowledge base has been updated. New members will now be guided with this information.",
+            color=0xF0A500,
+        )
+        await message.channel.send(embed=embed)
+        return True
+
+    session["history"].append({"role": "user", "content": content})
+
+    # Trim to 60 exchanges
+    sys_msgs   = [m for m in session["history"] if m["role"] == "system"]
+    convo_msgs = [m for m in session["history"] if m["role"] != "system"]
+    if len(convo_msgs) > 60:
+        convo_msgs = convo_msgs[-60:]
+    session["history"] = sys_msgs + convo_msgs
+
+    async with message.channel.typing():
+        response = await call_shadow_ai(session["history"])
+
+    if not response:
+        await message.channel.send("*Signal lost. Try again.*")
+        return True
+
+    session["history"].append({"role": "assistant", "content": response})
+
+    # ── Detect and save JSON doc block ────────────────────────────
+    import re as _re
+    match = _re.search(r"```json\s*(\{.*?\})\s*```", response, _re.DOTALL)
+    saved_doc = None
+    if match:
+        try:
+            import json as _json
+            data = _json.loads(match.group(1))
+            if data.get("save_doc"):
+                ok = await ghost_save_knowledge_doc(
+                    get_db_fn,
+                    doc_id  = data.get("doc_id", "doc"),
+                    title   = data.get("title", "Untitled"),
+                    content = data.get("content", ""),
+                    order   = data.get("order", 99),
+                )
+                saved_doc = data.get("title", "Doc") if ok else None
+                # Strip raw JSON from what we show the admin
+                response = _re.sub(r"```json\s*\{.*?\}\s*```", "", response, flags=_re.DOTALL).strip()
+                if saved_doc:
+                    response += f"\n\n*◈ **{saved_doc}** saved to Ghost's knowledge base.*"
+        except Exception as e:
+            print(f"[GHOST TRAIN] JSON parse error: {e}")
+
+    embed = discord.Embed(description=response, color=0xA855F7)
+    embed.set_author(name="◈ GHOST TRAINING")
+    embed.set_footer(text="Continue adding info · Type 'done' when finished")
+    await message.channel.send(embed=embed)
+    return True
+
+
+def train_is_active(uid: str) -> bool:
+    sess = _train_sessions.get(uid)
+    return bool(sess and sess["active"])
+
+
+async def train_stop(interaction: discord.Interaction):
+    """Force-stop a train session."""
+    uid = str(interaction.user.id)
+    if uid in _train_sessions:
+        _train_sessions.pop(uid)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="◈ TRAINING CANCELLED",
+                description="Session closed. Any docs already saved are still in the knowledge base.",
+                color=0xE63946,
+            ),
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="No active training session found.", color=0xE63946),
+            ephemeral=True,
+        )
+
+
+async def train_list(interaction: discord.Interaction, get_db_fn):
+    """List all knowledge docs currently in MongoDB."""
+    docs = await ghost_list_knowledge_docs(get_db_fn)
+    if not docs:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="◈ KNOWLEDGE BASE — EMPTY",
+                description="No docs saved yet. Use `/train start` to add knowledge.",
+                color=0xE63946,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    lines = "\n".join(
+        f"**{i+1}.** `{d['_id']}` — {d.get('title','?')}"
+        for i, d in enumerate(sorted(docs, key=lambda x: x.get("order", 99)))
+    )
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"◈ GHOST KNOWLEDGE BASE — {len(docs)} doc(s)",
+            description=lines,
+            color=0xA855F7,
+        ),
+        ephemeral=True,
+    )
+
+
+async def train_delete(interaction: discord.Interaction, doc_id: str, get_db_fn):
+    """Delete a knowledge doc by its ID."""
+    ok = await ghost_delete_knowledge_doc(get_db_fn, doc_id)
+    if ok:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="◈ DOC DELETED",
+                description=f"`{doc_id}` removed from Ghost's knowledge base.",
+                color=0xF0A500,
+            ),
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=f"No doc found with id `{doc_id}`.",
+                color=0xE63946,
+            ),
+            ephemeral=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
+# /SETWELCOME — ADMIN CUSTOMISE GENERAL CHANNEL MESSAGE
+# ══════════════════════════════════════════════════════════════════
+
+async def setwelcome_format(interaction: discord.Interaction, fmt: str, get_db_fn):
+    """Set which of the 4 preset formats Ghost uses when writing the welcome."""
+    if fmt not in WELCOME_FORMATS:
+        lines = "\n".join(f"`{k}` — **{v['name']}**: {v['tone'][:60]}..." for k, v in WELCOME_FORMATS.items())
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="◈ AVAILABLE FORMATS",
+                description=f"Choose a number 1–4:\n\n{lines}",
+                color=0xE63946,
+            ),
+            ephemeral=True,
+        )
+        return
+    await ghost_save_config(get_db_fn, "welcome_format", fmt)
+    chosen = WELCOME_FORMATS[fmt]
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"◈ FORMAT SET — {chosen['name']}",
+            description=f"Ghost will write welcome messages in this style:\n*{chosen['tone']}*",
+            color=0xA855F7,
+        ),
+        ephemeral=True,
+    )
+
+
+async def setwelcome_tone(interaction: discord.Interaction, instructions: str, get_db_fn):
+    """Add extra tone/style instructions on top of the chosen format."""
+    await ghost_save_config(get_db_fn, "welcome_tone_override", instructions)
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            description=f"✓ Extra tone instructions saved:\n*{instructions}*",
+            color=0xA855F7,
+        ),
+        ephemeral=True,
+    )
+
+
+async def setwelcome_title_override(interaction: discord.Interaction, title: str, get_db_fn):
+    """Override the auto-generated title with a fixed one (use {{name}} for member name)."""
+    await ghost_save_config(get_db_fn, "welcome_title_override", title)
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            description=f"✓ Title override set: **{title}**\n*(Use `{{name}}` to insert member name)*",
+            color=0xA855F7,
+        ),
+        ephemeral=True,
+    )
+
+
+async def setwelcome_color(interaction: discord.Interaction, hex_color: str, get_db_fn):
+    cleaned = hex_color.lstrip("#")
+    try:
+        int(cleaned, 16)
+    except ValueError:
+        await interaction.response.send_message(
+            embed=discord.Embed(description="Invalid hex color. Example: `7B2FBE` or `#A855F7`", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+    await ghost_save_config(get_db_fn, "welcome_color", cleaned)
+    await interaction.response.send_message(
+        embed=discord.Embed(description=f"✓ Welcome color set to `#{cleaned}`", color=int(cleaned, 16)),
+        ephemeral=True,
+    )
+
+
+async def setwelcome_banner(interaction: discord.Interaction, url: str, get_db_fn):
+    """Set a banner image shown at the bottom of the welcome embed."""
+    await ghost_save_config(get_db_fn, "welcome_banner", url)
+    await interaction.response.send_message(
+        embed=discord.Embed(description="✓ Banner image updated.", color=0xA855F7),
+        ephemeral=True,
+    )
+
+
+async def setwelcome_preview(interaction: discord.Interaction, get_db_fn):
+    """Generate and preview a real AI welcome using the current config — uses you as the test member."""
+    await interaction.response.defer(ephemeral=True)
+
+    config    = await ghost_load_config(get_db_fn)
+    knowledge = await ghost_load_knowledge(get_db_fn)
+    guild     = interaction.guild
+    member    = interaction.user
+
+    ai_text = await _generate_welcome_text(member, guild, knowledge, config)
+
+    fmt_id    = config.get("welcome_format", "1")
+    fmt       = WELCOME_FORMATS.get(str(fmt_id), WELCOME_FORMATS["1"])
+    color_hex = config.get("welcome_color", "7B2FBE")
+    banner    = config.get("welcome_banner")
+
+    try:
+        color = int(color_hex.lstrip("#"), 16)
+    except Exception:
+        color = 0x7B2FBE
+
+    raw_title = fmt["title_style"].format(name=member.display_name.upper())
+    title_override = config.get("welcome_title_override", "")
+    title = title_override.replace("{name}", member.display_name) if title_override else raw_title
+
+    embed = discord.Embed(
+        title=title,
+        description=f"{member.mention}\n\n{ai_text}",
+        color=color,
+    )
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    if guild.icon:
+        embed.set_author(name=guild.name, icon_url=guild.icon.url)
+    if banner:
+        embed.set_image(url=banner)
+
+    fmt_name = fmt["name"]
+    await interaction.followup.send(
+        content=f"*Preview — Format **{fmt_id}: {fmt_name}** — AI-generated in real time:*",
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+async def setwelcome_formats(interaction: discord.Interaction):
+    """Show all available format presets."""
+    lines = []
+    for k, v in WELCOME_FORMATS.items():
+        lines.append(f"**Format {k} — {v['name']}**\n*{v['tone']}*")
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="◈ GHOST WELCOME FORMATS",
+            description="\n\n".join(lines),
+            color=0xA855F7,
+        ),
+        ephemeral=True,
+    )
