@@ -530,6 +530,236 @@ async def start_plan_revise(message: discord.Message, load_data_fn, get_db_fn):
     await message.channel.send(response)
 
 
+# ══════════════════════════════════════════════════════════════════
+# ☽  SHADOW TODO — @shadowbot inline todo management
+#
+#  @shadowbot add task <text>
+#  @shadowbot remove task <n>
+#  @shadowbot done task <n>
+#  @shadowbot undone task <n>
+#  @shadowbot edit task <n> <new text>
+#  @shadowbot list tasks  /  tasks  /  todo list
+#  @shadowbot clear tasks
+#
+#  Token-free — bypasses the token economy entirely.
+# ══════════════════════════════════════════════════════════════════
+
+_TODO_PATTERNS = [
+    (re.compile(r"^(?:add|add task|new task|create task)\s+(.+)$", re.I),                           "add"),
+    (re.compile(r"^(?:remove|delete|remove task|delete task)\s+(?:task\s+)?#?(\d+)$", re.I),        "remove"),
+    (re.compile(r"^(?:done|complete|finish|tick)\s+(?:task\s+)?#?(\d+)$", re.I),                    "done"),
+    (re.compile(r"^mark\s+(?:task\s+)?#?(\d+)\s+(?:as\s+)?done$", re.I),                           "done"),
+    (re.compile(r"^(?:undone|uncheck|mark undone|incomplete)\s+(?:task\s+)?#?(\d+)$", re.I),        "undone"),
+    (re.compile(r"^(?:edit|rename|update)\s+(?:task\s+)?#?(\d+)\s+(?:to\s+)?(.+)$", re.I),         "edit"),
+    (re.compile(r"^(?:list tasks?|todo list|show tasks?|show todos?|my tasks?|tasks?)$", re.I),     "list"),
+    (re.compile(r"^(?:clear tasks?|clear todos?|wipe tasks?|delete all tasks?)$", re.I),            "clear"),
+]
+
+
+def _parse_todo_command(content: str):
+    """Returns (action, args) or (None, None)."""
+    text = content.strip()
+    for pattern, action in _TODO_PATTERNS:
+        m = pattern.match(text)
+        if m:
+            g = m.groups()
+            if action == "add":
+                return "add", {"text": g[0].strip()}
+            elif action == "remove":
+                return "remove", {"index": int(g[0])}
+            elif action == "done":
+                return "done", {"index": int(g[0])}
+            elif action == "undone":
+                return "undone", {"index": int(g[0])}
+            elif action == "edit":
+                return "edit", {"index": int(g[0]), "text": g[1].strip()}
+            elif action == "list":
+                return "list", {}
+            elif action == "clear":
+                return "clear", {}
+    return None, None
+
+
+def _get_todo_helpers():
+    import sys
+    main_mod = sys.modules.get("__main__")
+    if not main_mod:
+        raise ImportError("Main module not found")
+    return (
+        main_mod.load_data,
+        main_mod.save_data,
+        main_mod.set_todos_for_date,
+        main_mod.get_todos_for_date,
+        main_mod.today_str,
+        main_mod.get_shadow_id,
+    )
+
+
+async def handle_todo_command(
+    message: discord.Message,
+    action: str,
+    args: dict,
+    load_data_fn,
+    save_data_fn,
+) -> bool:
+    uid = str(message.author.id)
+
+    try:
+        _, _, set_todos_for_date, get_todos_for_date, today_str_fn, get_shadow_id_fn = _get_todo_helpers()
+    except Exception as e:
+        await message.reply(embed=discord.Embed(
+            title="▲ SYSTEM ERROR",
+            description=f"Could not connect to dossier system: `{e}`",
+            color=0xE63946,
+        ))
+        return False
+
+    data  = await load_data_fn()
+    today = today_str_fn()
+
+    shadow_id = get_shadow_id_fn(uid, data)
+    if not shadow_id:
+        await message.reply(embed=discord.Embed(
+            title="▲ NOT LINKED",
+            description="Link your Shadow ID first — `/link <shadow_id> <n>`.",
+            color=0xE63946,
+        ))
+        return False
+
+    tasks = get_todos_for_date(uid, today, data)
+
+    if action == "add":
+        tasks.append({"text": args["text"], "done": False, "ops": [], "priority": "p2", "source": "shadow_mention"})
+        set_todos_for_date(uid, today, tasks, data)
+        await save_data_fn(data)
+        await message.reply(embed=discord.Embed(
+            title="◈ TASK ADDED",
+            description=f"**#{len(tasks)}** — {args['text']}\n\nView: `/todo list`",
+            color=0x10B981,
+        ))
+        return True
+
+    elif action == "list":
+        if not tasks:
+            await message.reply(embed=discord.Embed(
+                title="◈ DOSSIER CLEAR",
+                description="No objectives logged today.\nAdd one: `@shadowbot add task <objective>`",
+                color=0x7B2FBE,
+            ))
+            return True
+        lines = []
+        for i, t in enumerate(tasks, 1):
+            status  = "✅" if t.get("done") else "⬜"
+            ops     = t.get("ops", [])
+            ops_str = f" `({sum(1 for o in ops if o.get('done'))}/{len(ops)} ops)`" if ops else ""
+            lines.append(f"{status} **#{i}** — {t.get('text','?')}{ops_str}")
+        done_count = sum(1 for t in tasks if t.get("done"))
+        await message.reply(embed=discord.Embed(
+            title=f"◈ TODAY'S DOSSIER — {today}",
+            description="\n".join(lines) + f"\n\n*{done_count}/{len(tasks)} complete*",
+            color=0x7B2FBE,
+        ))
+        return True
+
+    elif action == "remove":
+        n = args["index"]
+        if n < 1 or n > len(tasks):
+            await message.reply(embed=discord.Embed(
+                title="▲ INVALID TASK",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                color=0xE63946,
+            ))
+            return False
+        removed = tasks.pop(n - 1)
+        set_todos_for_date(uid, today, tasks, data)
+        await save_data_fn(data)
+        await message.reply(embed=discord.Embed(
+            title="◈ TASK REMOVED",
+            description=f"~~{removed.get('text','?')}~~ — wiped from your dossier.",
+            color=0xF0A500,
+        ))
+        return True
+
+    elif action == "done":
+        n = args["index"]
+        if n < 1 or n > len(tasks):
+            await message.reply(embed=discord.Embed(
+                title="▲ INVALID TASK",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                color=0xE63946,
+            ))
+            return False
+        if tasks[n - 1].get("done"):
+            await message.reply(embed=discord.Embed(
+                title="◈ ALREADY COMPLETE",
+                description=f"Task #{n} is already marked done.",
+                color=0x7B2FBE,
+            ))
+            return True
+        tasks[n - 1]["done"] = True
+        set_todos_for_date(uid, today, tasks, data)
+        await save_data_fn(data)
+        done_count = sum(1 for t in tasks if t.get("done"))
+        await message.reply(embed=discord.Embed(
+            title="✅ OBJECTIVE COMPLETE",
+            description=f"**#{n}** — {tasks[n-1].get('text','?')}\n\n*{done_count}/{len(tasks)} complete today.*",
+            color=0x10B981,
+        ))
+        return True
+
+    elif action == "undone":
+        n = args["index"]
+        if n < 1 or n > len(tasks):
+            await message.reply(embed=discord.Embed(
+                title="▲ INVALID TASK",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                color=0xE63946,
+            ))
+            return False
+        tasks[n - 1]["done"] = False
+        set_todos_for_date(uid, today, tasks, data)
+        await save_data_fn(data)
+        await message.reply(embed=discord.Embed(
+            title="◈ TASK REOPENED",
+            description=f"**#{n}** — {tasks[n-1].get('text','?')} — marked incomplete.",
+            color=0xF0A500,
+        ))
+        return True
+
+    elif action == "edit":
+        n = args["index"]
+        if n < 1 or n > len(tasks):
+            await message.reply(embed=discord.Embed(
+                title="▲ INVALID TASK",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                color=0xE63946,
+            ))
+            return False
+        old_text = tasks[n - 1].get("text", "?")
+        tasks[n - 1]["text"] = args["text"]
+        set_todos_for_date(uid, today, tasks, data)
+        await save_data_fn(data)
+        await message.reply(embed=discord.Embed(
+            title="◈ TASK UPDATED",
+            description=f"**#{n}** updated:\n~~{old_text}~~\n→ {args['text']}",
+            color=0x7B2FBE,
+        ))
+        return True
+
+    elif action == "clear":
+        count = len(tasks)
+        set_todos_for_date(uid, today, [], data)
+        await save_data_fn(data)
+        await message.reply(embed=discord.Embed(
+            title="◈ DOSSIER WIPED",
+            description=f"All {count} task(s) cleared from today's dossier.",
+            color=0xF0A500,
+        ))
+        return True
+
+    return False
+
+
 # ── MAIN HANDLER (mention) ────────────────────────────────────────
 async def handle_mention(
     message: discord.Message,
@@ -545,6 +775,12 @@ async def handle_mention(
     content = re.sub(r"<@!?\d+>", "", message.content).strip()
     if not content:
         content = "..."
+
+    # ── Todo command intercept (token-free) ───────────────────────
+    todo_action, todo_args = _parse_todo_command(content)
+    if todo_action:
+        await handle_todo_command(message, todo_action, todo_args, load_data_fn, save_data_fn)
+        return
 
     # ── Token check ───────────────────────────────────────────────
     had_tokens, remaining = await deduct_token(uid)
