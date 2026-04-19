@@ -1173,7 +1173,7 @@ Initiate (0) → Seeker (500) → Phantom (1500) → Wraith (3000) → Voidborn 
 
 def _build_ghost_system_prompt(knowledge: str) -> str:
     return f"""You are GHOST — the onboarding handler of the ShadowSeekers Order.
-You are not SHADOW (the main AI). You are specifically the recruiter who guides new members in.
+You guide new recruits through their first steps. You speak with authority and purpose.
 
 PERSONALITY:
 - Calm, direct, authoritative. Brief sentences. No filler.
@@ -1184,10 +1184,11 @@ PERSONALITY:
 YOUR ONLY JOB:
 - Help new operatives understand the server and take their first steps.
 - Answer questions using ONLY the knowledge base below.
-- If asked something outside the server scope: "I'm your Order handler. Ask me about the server."
-- Never break character. Never pretend to be a general AI.
+- If asked something outside the server scope, redirect: "Ask me about the server and your path forward."
+- Never break character. Never refer to yourself as an AI or clarify what you are not.
 - Keep answers to 2–5 sentences. Use code blocks for commands.
 - Steer them toward: /link first → /study → /echoes.
+- Sign off as Ghost when appropriate, never as Shadow or any other name.
 
 SERVER KNOWLEDGE BASE (your only source of truth):
 {knowledge}"""
@@ -1361,6 +1362,12 @@ WELCOME_FORMATS = {
         "structure":   "Brief them: new operative name detected. State the Order's mission in one sentence. List their immediate objectives: 1) /link 2) /study 3) /echoes. End with 'Standing by.'",
         "title_style": "◈ INTEL DROP — {name}",
     },
+    "custom": {
+        "name":        "Custom (AI-designed)",
+        "tone":        "",   # loaded from DB: config["welcome_custom_tone"]
+        "structure":   "",   # loaded from DB: config["welcome_custom_structure"]
+        "title_style": "☽ {name}",
+    },
 }
 
 _WELCOME_AI_SYSTEM = """You are Ghost, the onboarding handler of the ShadowSeekers Order.
@@ -1380,13 +1387,21 @@ async def _generate_welcome_text(
 
     fmt_id   = config.get("welcome_format", "1")
     fmt      = WELCOME_FORMATS.get(str(fmt_id), WELCOME_FORMATS["1"])
-    tone_override = config.get("welcome_tone_override", "")  # admin can add extra instructions
+    tone_override = config.get("welcome_tone_override", "")  # admin can add extra tone instructions
 
     member_count = guild.member_count or "?"
     server_name  = guild.name
 
-    # Pull a 2-sentence summary from knowledge for context
-    knowledge_snippet = knowledge[:600] if knowledge else "A high-performance study and accountability server."
+    # Use up to 2000 chars of trained knowledge so custom content actually reaches the AI
+    knowledge_snippet = knowledge[:2000] if knowledge else "A high-performance study and accountability server."
+
+    # For custom format, pull tone/structure from saved config instead of hardcoded presets
+    if str(fmt_id) == "custom":
+        fmt = {
+            "tone":        config.get("welcome_custom_tone",      "Direct, atmospheric, purpose-driven."),
+            "structure":   config.get("welcome_custom_structure", "Welcome them by name. Describe the Order briefly. Tell them to /link first."),
+            "title_style": config.get("welcome_title_override") or "☽ {name} HAS ARRIVED",
+        }
 
     prompt = (
         f"Write a #general welcome message for a new member.\n\n"
@@ -1788,15 +1803,143 @@ async def setwelcome_preview(interaction: discord.Interaction, get_db_fn):
 
 
 async def setwelcome_formats(interaction: discord.Interaction):
-    """Show all available format presets."""
+    """Show all available format presets including custom."""
     lines = []
     for k, v in WELCOME_FORMATS.items():
-        lines.append(f"**Format {k} — {v['name']}**\n*{v['tone']}*")
+        if k == "custom":
+            lines.append(f"**Format custom — {v['name']}**\n*Chat with AI to fully design your own tone, structure & title.*")
+        else:
+            lines.append(f"**Format {k} — {v['name']}**\n*{v['tone']}*")
     await interaction.response.send_message(
         embed=discord.Embed(
             title="◈ GHOST WELCOME FORMATS",
-            description="\n\n".join(lines),
+            description="\n\n".join(lines) + "\n\nUse `/setwelcome format <number or 'custom'>` to activate one.",
             color=0xA855F7,
         ),
         ephemeral=True,
     )
+
+
+# ══════════════════════════════════════════════════════════════════
+# /SETWELCOME FORMAT CUSTOM — AI-chat session to design welcome
+# ══════════════════════════════════════════════════════════════════
+
+# In-memory custom-welcome design sessions: uid -> {active, history, get_db_fn}
+_welcome_chat_sessions: dict[str, dict] = {}
+
+_CUSTOM_WELCOME_DESIGN_SYSTEM = """You are helping a Discord server admin design a custom welcome message style for their bot called Ghost.
+
+YOUR JOB:
+- Chat naturally with the admin to understand the vibe/tone/style they want for welcome messages.
+- Ask about: overall mood (dark? hype? mysterious? warm?), what they want said (server purpose, first steps, a catchphrase), title style, any phrases they love.
+- After 2–4 exchanges, when you have enough, output a JSON config block and NOTHING else after it.
+- Keep your chat replies short and sharp — this is a config tool, not a conversation.
+
+WHEN READY TO SAVE (after you understand what they want), output EXACTLY this JSON block:
+```json
+{"save_custom": true, "tone": "The tone description here — be specific and detailed for the AI.", "structure": "Exact structure instructions here — what to say, in what order, how to end.", "title_style": "The embed title template — use {name} for member display name"}
+```
+
+Rules:
+- NEVER output the JSON block until you've asked at least one question and gotten a response.
+- Once you output the JSON, add one final line: "✅ Custom format saved. Use `/setwelcome preview` to test it."
+- Keep tone/structure descriptions detailed enough that the welcome AI can follow them without asking questions.
+- title_style must contain {name} somewhere."""
+
+
+async def setwelcome_custom_start(interaction: discord.Interaction, get_db_fn):
+    """Start an AI chat session to design a custom welcome format."""
+    uid = str(interaction.user.id)
+
+    _welcome_chat_sessions[uid] = {
+        "active":    True,
+        "history":   [{"role": "system", "content": _CUSTOM_WELCOME_DESIGN_SYSTEM}],
+        "get_db_fn": get_db_fn,
+    }
+
+    opening_msg = [{"role": "system", "content": _CUSTOM_WELCOME_DESIGN_SYSTEM},
+                   {"role": "user",   "content": "Start the custom welcome design session with a brief intro and first question."}]
+    response = await call_shadow_ai(opening_msg)
+    if not response:
+        response = "Let's build your custom welcome. What's the overall vibe you want? (e.g. dark and mysterious, hype and motivational, cold military, warm community...)"
+
+    _welcome_chat_sessions[uid]["history"].append({"role": "assistant", "content": response})
+
+    embed = discord.Embed(
+        title="◈ CUSTOM WELCOME DESIGNER",
+        description=response,
+        color=0xA855F7,
+    )
+    embed.set_footer(text="Chat here to design your welcome · Type 'cancel' to abort")
+    await interaction.response.send_message(embed=embed)
+
+
+async def setwelcome_custom_handle_message(message: discord.Message, get_db_fn) -> bool:
+    """
+    Called from on_message during an active custom welcome design session.
+    Returns True if handled.
+    """
+    uid     = str(message.author.id)
+    session = _welcome_chat_sessions.get(uid)
+    if not session or not session["active"]:
+        return False
+
+    content = message.content.strip()
+    if not content:
+        return True
+
+    if content.lower() in ("cancel", "stop", "exit"):
+        _welcome_chat_sessions.pop(uid, None)
+        await message.channel.send(embed=discord.Embed(
+            description="◈ Custom welcome design cancelled. Your previous format is unchanged.",
+            color=0xE63946,
+        ))
+        return True
+
+    session["history"].append({"role": "user", "content": content})
+
+    async with message.channel.typing():
+        response = await call_shadow_ai(session["history"])
+
+    if not response:
+        await message.channel.send("*Signal lost. Try again.*")
+        return True
+
+    session["history"].append({"role": "assistant", "content": response})
+
+    # Check if AI output the save JSON block
+    match = re.search(r"```json\s*(\{.*?\})\s*```", response, re.DOTALL)
+    saved = False
+    clean_response = response
+
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            if data.get("save_custom"):
+                db_fn = session.get("get_db_fn") or get_db_fn
+                await ghost_save_config(db_fn, "welcome_format",           "custom")
+                await ghost_save_config(db_fn, "welcome_custom_tone",      data.get("tone", ""))
+                await ghost_save_config(db_fn, "welcome_custom_structure", data.get("structure", ""))
+                if data.get("title_style"):
+                    await ghost_save_config(db_fn, "welcome_title_override", data["title_style"])
+                saved = True
+                _welcome_chat_sessions.pop(uid, None)
+                clean_response = re.sub(r"```json\s*\{.*?\}\s*```", "", response, flags=re.DOTALL).strip()
+                if not clean_response:
+                    clean_response = "✅ Custom format saved. Use `/setwelcome preview` to test it."
+        except Exception as e:
+            print(f"[CUSTOM WELCOME] JSON parse error: {e}")
+            clean_response = response
+
+    color = 0x22C55E if saved else 0xA855F7
+    embed = discord.Embed(description=clean_response, color=color)
+    embed.set_author(name="◈ CUSTOM WELCOME DESIGNER")
+    if not saved:
+        embed.set_footer(text="Keep chatting to refine · Type 'cancel' to abort")
+    await message.channel.send(embed=embed)
+    return True
+
+
+def welcome_custom_is_active(uid: str) -> bool:
+    sess = _welcome_chat_sessions.get(uid)
+    return bool(sess and sess["active"])
