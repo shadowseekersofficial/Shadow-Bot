@@ -63,6 +63,7 @@ from shadow_ai import (
     # /setwelcome
     setwelcome_format, setwelcome_tone, setwelcome_title_override,
     setwelcome_color, setwelcome_banner, setwelcome_preview, setwelcome_formats,
+    setwelcome_custom_start, setwelcome_custom_handle_message, welcome_custom_is_active,
     WELCOME_FORMATS,
 )
 
@@ -3256,7 +3257,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Handle @Shadowbot mentions, Ghost DM replies, and /train channel sessions."""
+    """Handle @Shadowbot mentions, Ghost DM replies, and /train + /setwelcome custom channel sessions."""
     if message.author.bot:
         return
 
@@ -3268,10 +3269,15 @@ async def on_message(message: discord.Message):
             await ghost_handle_dm(message, get_db)
             return
 
-    # /train: intercept channel messages from admins in a training session
+    # Channel-only session handlers (admin tools)
     if not isinstance(message.channel, discord.DMChannel):
+        # /train: intercept channel messages from admins in a training session
         if train_is_active(uid):
             await train_handle_message(message, get_db)
+            return
+        # /setwelcome custom: intercept messages from admins designing a custom welcome
+        if welcome_custom_is_active(uid):
+            await setwelcome_custom_handle_message(message, get_db)
             return
 
     if bot.user in message.mentions:
@@ -3345,14 +3351,26 @@ welcome_group = app_commands.Group(name="setwelcome", description="Admin: custom
 tree.add_command(welcome_group)
 
 
-@welcome_group.command(name="format", description="Choose one of 4 preset styles Ghost uses to write the welcome")
-@app_commands.describe(number="Format number: 1=Operative Briefing, 2=Shadow Initiation, 3=Grind Culture, 4=Ghost Intel Drop")
+@welcome_group.command(name="format", description="Choose a welcome style: 1=Operative Briefing, 2=Shadow Initiation, 3=Grind Culture, 4=Ghost Intel Drop, custom=AI-designed")
+@app_commands.describe(number="Format number 1–4, or 'custom' to design your own via AI chat")
 async def setwelcome_format_cmd(interaction: discord.Interaction, number: str):
     if not _is_admin(interaction):
         await interaction.response.send_message(
             embed=make_embed("▲ ACCESS DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
-    await setwelcome_format(interaction, number, get_db)
+    if number.lower() == "custom":
+        await setwelcome_custom_start(interaction, get_db)
+    else:
+        await setwelcome_format(interaction, number, get_db)
+
+
+@welcome_group.command(name="custom", description="Design a fully custom welcome style by chatting with AI")
+async def setwelcome_custom_cmd(interaction: discord.Interaction):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ ACCESS DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    await setwelcome_custom_start(interaction, get_db)
 
 
 @welcome_group.command(name="tone", description="Add extra tone/vibe instructions for the AI on top of the format")
