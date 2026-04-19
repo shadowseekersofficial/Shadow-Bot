@@ -64,6 +64,7 @@ from shadow_ai import (
     setwelcome_format, setwelcome_tone, setwelcome_title_override,
     setwelcome_color, setwelcome_banner, setwelcome_preview, setwelcome_formats,
     setwelcome_custom_start, setwelcome_custom_handle_message, welcome_custom_is_active,
+    setwelcome_dm_start, setwelcome_dm_handle_message, dm_design_is_active,
     WELCOME_FORMATS,
 )
 
@@ -3279,6 +3280,10 @@ async def on_message(message: discord.Message):
         if welcome_custom_is_active(uid):
             await setwelcome_custom_handle_message(message, get_db)
             return
+        # /setwelcome dm: intercept messages from admins designing the DM intro style
+        if dm_design_is_active(uid):
+            await setwelcome_dm_handle_message(message, get_db)
+            return
 
     if bot.user in message.mentions:
         await handle_mention(message, bot, load_data, save_data, get_db)
@@ -3371,6 +3376,15 @@ async def setwelcome_custom_cmd(interaction: discord.Interaction):
             embed=make_embed("▲ ACCESS DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
     await setwelcome_custom_start(interaction, get_db)
+
+
+@welcome_group.command(name="dm", description="Design Ghost's DM intro message for new members via AI chat")
+async def setwelcome_dm_cmd(interaction: discord.Interaction):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ ACCESS DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    await setwelcome_dm_start(interaction, get_db)
 
 
 @welcome_group.command(name="tone", description="Add extra tone/vibe instructions for the AI on top of the format")
