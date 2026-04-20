@@ -1507,8 +1507,9 @@ async def _ghost_general_welcome(
 
     # Title uses the format's template with member name
     raw_title = fmt["title_style"].format(name=member.display_name.upper())
-    # Admin can override title entirely
-    title = config.get("welcome_title_override") or raw_title
+    # Admin can override title — support {name} placeholder
+    title_override = config.get("welcome_title_override", "")
+    title = title_override.replace("{name}", member.display_name.upper()) if title_override else raw_title
 
     embed = discord.Embed(
         title=title,
