@@ -22,11 +22,16 @@ GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 GROQ_API_URL      = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL        = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GENERAL_CHANNEL   = os.getenv("GENERAL_CHANNEL", "general")
+# Set MISSION_CHANNEL to post AI missions in a dedicated channel (e.g. "ai-missions")
+# Leave unset to fall back to GENERAL_CHANNEL
+MISSION_CHANNEL   = os.getenv("MISSION_CHANNEL", "")
 MISSION_GEN_HOUR  = int(os.getenv("MISSION_GEN_HOUR", "6"))
 MISSION_GEN_MIN   = int(os.getenv("MISSION_GEN_MIN", "0"))
 TIMEZONE          = os.getenv("TIMEZONE", "Asia/Kolkata")
 
 _pending_missions: dict[str, list[str]] = {}
+# UIDs who opted out of daily AI mission broadcasts
+_mission_optouts: set[str] = set()
 
 
 # ── GROQ CALL ─────────────────────────────────────────────────────
@@ -352,13 +357,20 @@ async def ai_mission_task():
 
     data = await load_data()
     for guild in _bot_ref.guilds:
-        general_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
-        if not general_ch:
+        # Use dedicated mission channel if set, else fall back to general
+        target_ch_name = MISSION_CHANNEL if MISSION_CHANNEL else GENERAL_CHANNEL
+        mission_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
+        if not mission_ch:
+            mission_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
+        if not mission_ch:
             continue
         approved_uids = [uid for uid, link in data["links"].items() if link.get("approved")]
         print(f"[AI MISSIONS] Generating for {len(approved_uids)} operatives...")
 
         for uid in approved_uids:
+            # Skip opted-out users
+            if uid in _mission_optouts:
+                continue
             try:
                 await asyncio.sleep(1.5)
                 ctx = build_rich_context(uid, data)
@@ -368,7 +380,7 @@ async def ai_mission_task():
                 discord_member = guild.get_member(int(uid))
                 mention = discord_member.mention if discord_member else f"`{ctx['codename']}`"
                 embed = make_mission_embed(ctx["codename"], ctx["tier"], missions, ctx=ctx)
-                await general_ch.send(content=f"{mention} — your missions for today have arrived.", embed=embed)
+                await mission_ch.send(content=f"{mention} — your missions for today have arrived.", embed=embed)
             except Exception as e:
                 print(f"[AI MISSIONS] Error for uid={uid}: {e}")
 
@@ -381,10 +393,11 @@ def register_commands(tree: app_commands.CommandTree):
     @tree.command(name="acceptmissions", description="Deploy today's AI missions to your dossier ('all' or '1,3,5')")
     @app_commands.describe(numbers="Which missions to accept: 'all' or comma-separated e.g. '1,3,5'")
     async def acceptmissions(interaction: discord.Interaction, numbers: str = "all"):
+        await interaction.response.defer()
         uid = str(interaction.user.id)
         missions = _pending_missions.get(uid)
         if not missions:
-            await interaction.response.send_message(embed=discord.Embed(
+            await interaction.followup.send(embed=discord.Embed(
                 title="◈ NO MISSIONS PENDING",
                 description="Use `/generatemissions` to generate now, or wait for 6 AM broadcast.",
                 color=0x6B6B9A,
@@ -398,7 +411,7 @@ def register_commands(tree: app_commands.CommandTree):
                 indices = [int(x.strip()) for x in numbers.split(",")]
                 invalid = [n for n in indices if n < 1 or n > len(missions)]
                 if invalid:
-                    await interaction.response.send_message(embed=discord.Embed(
+                    await interaction.followup.send(embed=discord.Embed(
                         title="▲ INVALID NUMBERS",
                         description=f"Mission(s) {', '.join(str(n) for n in invalid)} don't exist. You have {len(missions)}.",
                         color=0xE63946,
@@ -406,7 +419,7 @@ def register_commands(tree: app_commands.CommandTree):
                     return
                 selected = [missions[i - 1] for i in indices]
             except ValueError:
-                await interaction.response.send_message(embed=discord.Embed(
+                await interaction.followup.send(embed=discord.Embed(
                     title="▲ INVALID INPUT", description="Use `all` or comma-separated numbers.", color=0xE63946,
                 ))
                 return
@@ -421,7 +434,7 @@ def register_commands(tree: app_commands.CommandTree):
             today_str          = main_mod.today_str
             make_embed         = main_mod.make_embed
         except Exception as e:
-            await interaction.response.send_message(embed=discord.Embed(
+            await interaction.followup.send(embed=discord.Embed(
                 title="▲ INTEGRATION ERROR", description=f"`{e}`", color=0xE63946,
             ))
             return
@@ -429,7 +442,7 @@ def register_commands(tree: app_commands.CommandTree):
         data = await load_data()
         shadow_id = get_shadow_id(uid, data)
         if not shadow_id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
             return
 
@@ -446,7 +459,7 @@ def register_commands(tree: app_commands.CommandTree):
             del _pending_missions[uid]
 
         lines = "\n".join(f"◈ {m}" for m in selected)
-        await interaction.response.send_message(embed=make_embed(
+        await interaction.followup.send(embed=make_embed(
             "✅ MISSIONS DEPLOYED",
             f"**{len(selected)} mission{'s' if len(selected) != 1 else ''}** added 🤖:\n\n{lines}\n\nView: `/todo list`",
             color=0x10B981,
@@ -520,6 +533,52 @@ def register_commands(tree: app_commands.CommandTree):
             color=0xA855F7,
         ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"))
 
+    @tree.command(name="stopmissions", description="Opt out of daily AI mission broadcasts — use /startmissions to re-enable")
+    async def stopmissions(interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        if uid in _mission_optouts:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="◈ ALREADY OPTED OUT",
+                description="You're already off the daily mission broadcast.\nUse `/startmissions` to re-enable.",
+                color=0x6B6B9A,
+            ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
+            ephemeral=True)
+            return
+        _mission_optouts.add(uid)
+        await interaction.response.send_message(embed=discord.Embed(
+            title="🔕 MISSION BROADCASTS STOPPED",
+            description=(
+                "You won't receive daily AI mission pings anymore.\n\n"
+                "◈ You can still use `/generatemissions` anytime to generate on-demand.\n"
+                "◈ Use `/startmissions` to re-enable broadcasts."
+            ),
+            color=0xF0A500,
+        ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
+        ephemeral=True)
+
+    @tree.command(name="startmissions", description="Re-enable daily AI mission broadcasts after using /stopmissions")
+    async def startmissions(interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        if uid not in _mission_optouts:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="◈ ALREADY ACTIVE",
+                description="You're already receiving daily mission broadcasts.",
+                color=0x10B981,
+            ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
+            ephemeral=True)
+            return
+        _mission_optouts.discard(uid)
+        await interaction.response.send_message(embed=discord.Embed(
+            title="🔔 MISSION BROADCASTS ENABLED",
+            description=(
+                "You're back on the daily mission roster.\n\n"
+                "◈ Next broadcast arrives at the scheduled time.\n"
+                "◈ Use `/stopmissions` anytime to opt out again."
+            ),
+            color=0x10B981,
+        ).set_footer(text="☽ SHADOWSEEKERS ORDER · AI MISSION ENGINE"),
+        ephemeral=True)
+
 
 # ── SETUP ─────────────────────────────────────────────────────────
 def setup_ai_missions(bot, tree: app_commands.CommandTree):
@@ -528,4 +587,5 @@ def setup_ai_missions(bot, tree: app_commands.CommandTree):
     _tree_ref = tree
     register_commands(tree)
     print("[AI MISSIONS] AI Mission Generator registered ✓")
-    print(f"[AI MISSIONS] Daily broadcast at {MISSION_GEN_HOUR}:{MISSION_GEN_MIN:02d} {TIMEZONE}")
+    ch_display = MISSION_CHANNEL if MISSION_CHANNEL else f"{GENERAL_CHANNEL} (fallback)"
+    print(f"[AI MISSIONS] Daily broadcast at {MISSION_GEN_HOUR}:{MISSION_GEN_MIN:02d} {TIMEZONE} → #{ch_display}")
