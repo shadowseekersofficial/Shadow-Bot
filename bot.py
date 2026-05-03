@@ -3748,6 +3748,9 @@ async def on_message(message: discord.Message):
         if train_is_active(uid):
             await train_handle_message(message, get_db)
             return
+        # /voidlore set: intercept admin pasted lore content
+        if await voidlore_handle_message(message):
+            return
         # /setwelcome custom: intercept messages from admins designing a custom welcome
         if welcome_custom_is_active(uid):
             await setwelcome_custom_handle_message(message, get_db)
@@ -4567,4 +4570,267 @@ async def viewshadowcard_cmd(interaction: discord.Interaction, user: discord.Mem
     embed.set_image(url=card["image_url"])
     embed.set_footer(text="☽ SHADOWSEEKERS ORDER · Shadow Records")
     await interaction.followup.send(embed=embed)
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# /voidlore — Admin-only: write ShadowSeekers lore into MongoDB
+#   so both Void (void_server.py) and shadowbot know the Order's
+#   world, rules, culture, and any custom knowledge admins define.
+#
+#   MongoDB collection: shadowbot["void_lore"]
+#   Each doc: { _id: "slug", title: "...", content: "...", order: N }
+#   void_server.py loads all docs at chat time and injects them.
+# ══════════════════════════════════════════════════════════════════
+
+VOID_LORE_COLLECTION = "void_lore"
+
+# ── Mongo helpers ─────────────────────────────────────────────────
+
+async def void_lore_save(doc_id: str, title: str, content: str, order: int = 99) -> bool:
+    db = get_db()
+    if db is None:
+        return False
+    try:
+        await db[VOID_LORE_COLLECTION].update_one(
+            {"_id": doc_id},
+            {"$set": {"title": title, "content": content, "order": order, "updated": datetime.utcnow().isoformat()}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[VOID LORE] Save failed: {e}")
+        return False
+
+
+async def void_lore_list() -> list:
+    db = get_db()
+    if db is None:
+        return []
+    try:
+        docs = await db[VOID_LORE_COLLECTION].find(
+            {}, {"_id": 1, "title": 1, "order": 1, "updated": 1}
+        ).to_list(length=200)
+        return sorted(docs, key=lambda d: d.get("order", 99))
+    except Exception as e:
+        print(f"[VOID LORE] List failed: {e}")
+        return []
+
+
+async def void_lore_get(doc_id: str) -> dict | None:
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        return await db[VOID_LORE_COLLECTION].find_one({"_id": doc_id})
+    except Exception as e:
+        print(f"[VOID LORE] Get failed: {e}")
+        return None
+
+
+async def void_lore_delete(doc_id: str) -> bool:
+    db = get_db()
+    if db is None:
+        return False
+    try:
+        result = await db[VOID_LORE_COLLECTION].delete_one({"_id": doc_id})
+        return result.deleted_count > 0
+    except Exception as e:
+        print(f"[VOID LORE] Delete failed: {e}")
+        return False
+
+# ── Active modal sessions for /voidlore set ───────────────────────
+_voidlore_sessions: dict[str, dict] = {}   # uid → {doc_id, title, order}
+
+# ── Command group ─────────────────────────────────────────────────
+
+voidlore_group = app_commands.Group(
+    name="voidlore",
+    description="[ADMIN] Manage Void + ShadowBot world knowledge stored in MongoDB",
+)
+tree.add_command(voidlore_group)
+
+
+# ── /voidlore set ─────────────────────────────────────────────────
+@voidlore_group.command(
+    name="set",
+    description="Create or overwrite a lore doc. Bot will guide you to paste the content.",
+)
+@app_commands.describe(
+    doc_id="Short slug key, e.g. 'ranks', 'archetypes', 'culture' (no spaces)",
+    title="Human-readable title shown in /voidlore list",
+    order="Display/injection order (lower = first). Default 99.",
+)
+async def voidlore_set_cmd(
+    interaction: discord.Interaction,
+    doc_id: str,
+    title: str,
+    order: int = 99,
+):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+
+    doc_id = doc_id.lower().strip().replace(" ", "_")
+    uid = str(interaction.user.id)
+    _voidlore_sessions[uid] = {"doc_id": doc_id, "title": title, "order": order}
+
+    embed = make_embed(
+        "◈ VOID LORE — AWAITING CONTENT",
+        f"**Doc ID:** `{doc_id}`\n**Title:** {title}\n**Order:** {order}\n\n"
+        "Paste the lore content in your **next message** in this channel.\n"
+        "Type `cancel` to abort.",
+        color=0x7B2FBE,
+    )
+    embed.set_footer(text="◈ Content will be injected into Void + ShadowBot context at runtime.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── on_message handler — call this from your existing on_message ──
+async def voidlore_handle_message(message: discord.Message) -> bool:
+    """
+    Call from on_message BEFORE other handlers.
+    Returns True if the message was consumed by a voidlore session.
+    """
+    uid = str(message.author.id)
+    session = _voidlore_sessions.get(uid)
+    if not session:
+        return False
+
+    content = message.content.strip()
+    if content.lower() == "cancel":
+        _voidlore_sessions.pop(uid, None)
+        await message.channel.send(
+            embed=make_embed("◈ VOID LORE", "Session cancelled.", color=0x6B6B9A),
+            delete_after=8,
+        )
+        return True
+
+    # Delete the message to keep the channel clean (it may have sensitive lore)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    doc_id = session["doc_id"]
+    title  = session["title"]
+    order  = session["order"]
+    _voidlore_sessions.pop(uid, None)
+
+    ok = await void_lore_save(doc_id, title, content, order)
+
+    if ok:
+        embed = make_embed(
+            "◈ VOID LORE SAVED",
+            f"**`{doc_id}`** — {title}\n"
+            f"{len(content):,} characters written to MongoDB.\n\n"
+            "The Void and ShadowBot will read this on the next conversation.",
+            color=0x10B981,
+        )
+    else:
+        embed = make_embed(
+            "▲ VOID LORE — SAVE FAILED",
+            "MongoDB write error. Check bot logs.",
+            color=0xE63946,
+        )
+
+    await message.channel.send(embed=embed, delete_after=15)
+    return True
+
+
+# ── /voidlore list ────────────────────────────────────────────────
+@voidlore_group.command(name="list", description="List all lore docs saved in MongoDB")
+async def voidlore_list_cmd(interaction: discord.Interaction):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    docs = await void_lore_list()
+
+    if not docs:
+        await interaction.followup.send(
+            embed=make_embed("◈ VOID LORE", "No lore docs saved yet.\nUse `/voidlore set` to add one.", color=0x6B6B9A),
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for d in docs:
+        updated = d.get("updated", "—")[:10] if d.get("updated") else "—"
+        lines.append(f"`{d['_id']}` · **{d.get('title','Untitled')}** · order {d.get('order',99)} · {updated}")
+
+    embed = make_embed(
+        f"◈ VOID LORE — {len(docs)} doc(s)",
+        "\n".join(lines),
+        color=0x7B2FBE,
+    )
+    embed.set_footer(text="Use /voidlore view <doc_id> to read content · /voidlore delete <doc_id> to remove")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ── /voidlore view ────────────────────────────────────────────────
+@voidlore_group.command(name="view", description="Read the full content of a lore doc")
+@app_commands.describe(doc_id="The slug ID of the doc to view")
+async def voidlore_view_cmd(interaction: discord.Interaction, doc_id: str):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    doc = await void_lore_get(doc_id.lower().strip())
+
+    if not doc:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT FOUND", f"No lore doc with ID `{doc_id}`.", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+
+    content = doc.get("content", "")
+    # Discord embed limit: 4096 chars
+    preview = content[:3900] + ("\n\n*...truncated*" if len(content) > 3900 else "")
+
+    embed = make_embed(
+        f"◈ {doc.get('title', doc_id)}",
+        preview,
+        color=0x7B2FBE,
+    )
+    embed.set_footer(text=f"doc_id: {doc_id} · {len(content):,} chars total")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ── /voidlore delete ──────────────────────────────────────────────
+@voidlore_group.command(name="delete", description="Delete a lore doc from MongoDB")
+@app_commands.describe(doc_id="The slug ID of the doc to delete")
+async def voidlore_delete_cmd(interaction: discord.Interaction, doc_id: str):
+    if not _is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    deleted = await void_lore_delete(doc_id.lower().strip())
+
+    if deleted:
+        await interaction.followup.send(
+            embed=make_embed("◈ VOID LORE DELETED", f"`{doc_id}` has been removed from MongoDB.", color=0x10B981),
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT FOUND", f"No doc with ID `{doc_id}` — nothing deleted.", color=0xE63946),
+            ephemeral=True,
+        )
 
