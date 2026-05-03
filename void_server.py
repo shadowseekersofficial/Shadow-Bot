@@ -186,10 +186,30 @@ async def gas_verify_login(shadow_id: str, passphrase: str) -> bool:
         return True   # fail open — don't block if GAS is down
 
 
+async def gas_fetch_recent_sessions(shadow_id: str, limit: int = 5) -> list:
+    """Fetch last N study sessions for this operative from GAS Shadow Journey sheet."""
+    if not GAS_URL:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                GAS_URL,
+                params={"action": "getSessions", "shadowId": shadow_id, "limit": limit},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, list):
+                        return data
+    except Exception as e:
+        print(f"[VOID SERVER] GAS sessions fetch failed {shadow_id}: {e}")
+    return []
+
+
 # ── MONGO HELPERS ─────────────────────────────────────────────────
 
 async def mongo_get_void_state(shadow_id: str) -> dict:
-    """Get rolling 20 messages + memory snapshot from MongoDB."""
+    """Get rolling 40 messages (20 user + 20 void) + memory snapshot from MongoDB."""
     db = get_void_db()
     if db is None:
         return {"messages": [], "snapshot": ""}
@@ -211,8 +231,8 @@ async def mongo_save_void_state(shadow_id: str, messages: list, snapshot: str):
     if db is None:
         return
     try:
-        # Keep only last 20 messages
-        recent = messages[-20:] if len(messages) > 20 else messages
+        # Keep last 40 messages (20 user + 20 void = 40 total)
+        recent = messages[-40:] if len(messages) > 40 else messages
         await db["void_chats"].update_one(
             {"_id": shadow_id},
             {"$set": {
@@ -296,19 +316,28 @@ async def mongo_get_todos_today(discord_uid: str) -> list:
 
 
 async def mongo_find_discord_uid(shadow_id: str) -> str | None:
-    """Find Discord UID from Shadow ID via links collection."""
+    """Find Discord UID — reads discordId directly from members array."""
     db = get_db()
     if db is None:
         return None
     try:
-        doc = await db["data"].find_one({"_id": "main"})
+        # Primary: read discordId from members array
+        doc = await db["members"].find_one({"_id": "list"})
         if doc:
-            links = doc.get("links", {})
+            for m in doc.get("members", []):
+                if m.get("shadowId") == shadow_id:
+                    did = m.get("discordId", "")
+                    if did:
+                        return str(did)
+        # Fallback: links in data collection
+        doc2 = await db["data"].find_one({"_id": "main"})
+        if doc2:
+            links = doc2.get("links", {})
             for uid, link in links.items():
                 if isinstance(link, dict) and link.get("shadow_id") == shadow_id and link.get("approved"):
                     return uid
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[VOID SERVER] Discord UID fetch failed {shadow_id}: {e}")
     return None
 
 
@@ -402,6 +431,18 @@ async def build_operative_context(shadow_id: str) -> str:
                 todo_lines.append(f"  [{status}] {task_text}")
     todo_block = "\n".join(todo_lines) if todo_lines else "  No objectives logged today."
 
+    # Recent study sessions from GAS Shadow Journey
+    session_lines = []
+    sessions = await gas_fetch_recent_sessions(shadow_id, limit=5)
+    for s in sessions:
+        task     = s.get("task", "")
+        duration = s.get("duration", "")
+        date     = s.get("date", "")
+        echoes_s = s.get("echoes", 0)
+        if task:
+            session_lines.append(f"  {date} — {task} ({duration}, +{echoes_s} echoes)")
+    session_block = "\n".join(session_lines) if session_lines else "  No recent sessions logged."
+
     context = f"""OPERATIVE PROFILE:
 Codename: {codename} | Shadow ID: {shadow_id}
 Archetype: {archetype} | Rank: {rank} | Echoes: {echoes:,}
@@ -412,7 +453,10 @@ Upcoming exams:
 {exam_block}
 
 Today's objectives:
-{todo_block}"""
+{todo_block}
+
+Recent study sessions (last 5):
+{session_block}"""
 
     return context
 
@@ -617,7 +661,7 @@ async def void_chat(req: ChatRequest):
 
     # Rolling 20 + new message
     convo    = [m for m in messages if m["role"] in ("user", "assistant")]
-    convo    = convo[-19:]   # make room for new message
+    convo    = convo[-39:]   # make room for new message (keep 39 + 1 new = 40 total)
     new_user = {"role": "user", "content": req.message.strip()}
     convo.append(new_user)
 
