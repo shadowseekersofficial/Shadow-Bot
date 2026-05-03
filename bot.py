@@ -3729,6 +3729,48 @@ async def on_member_join(member: discord.Member):
 
 
 @bot.event
+
+async def voidlore_handle_message(message: discord.Message) -> bool:
+    """Call from on_message. Returns True if message was consumed."""
+    uid = str(message.author.id)
+    session = _voidlore_sessions.get(uid)
+    if not session:
+        return False
+
+    content = message.content.strip()
+    if content.lower() == "cancel":
+        _voidlore_sessions.pop(uid, None)
+        await message.channel.send(
+            embed=make_embed("◈ VOID LORE", "Session cancelled.", color=0x6B6B9A),
+            delete_after=8,
+        )
+        return True
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    doc_id = session["doc_id"]
+    title  = session["title"]
+    order  = session["order"]
+    _voidlore_sessions.pop(uid, None)
+
+    ok = await void_lore_save(doc_id, title, content, order)
+
+    if ok:
+        embed = make_embed(
+            "◈ VOID LORE SAVED",
+            f"**`{doc_id}`** — {title}\n{len(content):,} characters written to MongoDB.\n\nVoid and ShadowBot will use this on the next conversation.",
+            color=0x10B981,
+        )
+    else:
+        embed = make_embed("▲ VOID LORE — SAVE FAILED", "MongoDB write error. Check bot logs.", color=0xE63946)
+
+    await message.channel.send(embed=embed, delete_after=15)
+    return True
+
+
 async def on_message(message: discord.Message):
     """Handle @Shadowbot mentions, Ghost DM replies, and /train + /setwelcome custom channel sessions."""
     if message.author.bot:
@@ -4440,15 +4482,12 @@ async def on_ready():
     print("[SHADOW BOT] Realtime leaderboards seeded")
 
 
-
 # ══════════════════════════════════════════════════════════════════
 # /voidlore — Admin-only: write ShadowSeekers lore into MongoDB
 #   so both Void (void_server.py) and shadowbot know the Order's
 #   world, rules, culture, and any custom knowledge admins define.
-#
 #   MongoDB collection: shadowbot["void_lore"]
 #   Each doc: { _id: "slug", title: "...", content: "...", order: N }
-#   void_server.py loads all docs at chat time and injects them.
 # ══════════════════════════════════════════════════════════════════
 
 VOID_LORE_COLLECTION = "void_lore"
@@ -4507,200 +4546,231 @@ async def void_lore_delete(doc_id: str) -> bool:
         print(f"[VOID LORE] Delete failed: {e}")
         return False
 
-# ── Active modal sessions for /voidlore set ───────────────────────
-_voidlore_sessions: dict[str, dict] = {}   # uid → {doc_id, title, order}
+
+# ── Active sessions for /voidlore set ────────────────────────────
+_voidlore_sessions: dict[str, dict] = {}
+
 
 # ── Command group ─────────────────────────────────────────────────
 
 voidlore_group = app_commands.Group(
     name="voidlore",
-    description="[ADMIN] Manage Void + ShadowBot world knowledge stored in MongoDB",
+    description="[ADMIN] Manage Void + ShadowBot world knowledge in MongoDB",
 )
 tree.add_command(voidlore_group)
 
 
-# ── /voidlore set ─────────────────────────────────────────────────
-@voidlore_group.command(
-    name="set",
-    description="Create or overwrite a lore doc. Bot will guide you to paste the content.",
-)
+@voidlore_group.command(name="set", description="Create or overwrite a lore doc")
 @app_commands.describe(
-    doc_id="Short slug key, e.g. 'ranks', 'archetypes', 'culture' (no spaces)",
+    doc_id="Short slug, e.g. ranks / archetypes / culture (no spaces)",
     title="Human-readable title shown in /voidlore list",
-    order="Display/injection order (lower = first). Default 99.",
+    order="Injection order — lower = first (default 99)",
 )
-async def voidlore_set_cmd(
-    interaction: discord.Interaction,
-    doc_id: str,
-    title: str,
-    order: int = 99,
-):
+async def voidlore_set_cmd(interaction: discord.Interaction, doc_id: str, title: str, order: int = 99):
     if not _is_admin(interaction):
         await interaction.response.send_message(
-            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
-
     doc_id = doc_id.lower().strip().replace(" ", "_")
     uid = str(interaction.user.id)
     _voidlore_sessions[uid] = {"doc_id": doc_id, "title": title, "order": order}
-
     embed = make_embed(
         "◈ VOID LORE — AWAITING CONTENT",
-        f"**Doc ID:** `{doc_id}`\n**Title:** {title}\n**Order:** {order}\n\n"
-        "Paste the lore content in your **next message** in this channel.\n"
-        "Type `cancel` to abort.",
+        f"**Doc ID:** `{doc_id}`\n**Title:** {title}\n**Order:** {order}\n\nPaste the lore content in your **next message**.\nType `cancel` to abort.",
         color=0x7B2FBE,
     )
-    embed.set_footer(text="◈ Content will be injected into Void + ShadowBot context at runtime.")
+    embed.set_footer(text="◈ Content will be injected into Void + ShadowBot at runtime.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── on_message handler — call this from your existing on_message ──
-async def voidlore_handle_message(message: discord.Message) -> bool:
-    """
-    Call from on_message BEFORE other handlers.
-    Returns True if the message was consumed by a voidlore session.
-    """
-    uid = str(message.author.id)
-    session = _voidlore_sessions.get(uid)
-    if not session:
-        return False
-
-    content = message.content.strip()
-    if content.lower() == "cancel":
-        _voidlore_sessions.pop(uid, None)
-        await message.channel.send(
-            embed=make_embed("◈ VOID LORE", "Session cancelled.", color=0x6B6B9A),
-            delete_after=8,
-        )
-        return True
-
-    # Delete the message to keep the channel clean (it may have sensitive lore)
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    doc_id = session["doc_id"]
-    title  = session["title"]
-    order  = session["order"]
-    _voidlore_sessions.pop(uid, None)
-
-    ok = await void_lore_save(doc_id, title, content, order)
-
-    if ok:
-        embed = make_embed(
-            "◈ VOID LORE SAVED",
-            f"**`{doc_id}`** — {title}\n"
-            f"{len(content):,} characters written to MongoDB.\n\n"
-            "The Void and ShadowBot will read this on the next conversation.",
-            color=0x10B981,
-        )
-    else:
-        embed = make_embed(
-            "▲ VOID LORE — SAVE FAILED",
-            "MongoDB write error. Check bot logs.",
-            color=0xE63946,
-        )
-
-    await message.channel.send(embed=embed, delete_after=15)
-    return True
-
-
-# ── /voidlore list ────────────────────────────────────────────────
 @voidlore_group.command(name="list", description="List all lore docs saved in MongoDB")
 async def voidlore_list_cmd(interaction: discord.Interaction):
     if not _is_admin(interaction):
         await interaction.response.send_message(
-            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True)
     docs = await void_lore_list()
-
     if not docs:
         await interaction.followup.send(
-            embed=make_embed("◈ VOID LORE", "No lore docs saved yet.\nUse `/voidlore set` to add one.", color=0x6B6B9A),
-            ephemeral=True,
-        )
+            embed=make_embed("◈ VOID LORE", "No lore docs saved yet. Use `/voidlore set` to add one.", color=0x6B6B9A),
+            ephemeral=True)
         return
-
     lines = []
     for d in docs:
         updated = d.get("updated", "—")[:10] if d.get("updated") else "—"
         lines.append(f"`{d['_id']}` · **{d.get('title','Untitled')}** · order {d.get('order',99)} · {updated}")
-
-    embed = make_embed(
-        f"◈ VOID LORE — {len(docs)} doc(s)",
-        "\n".join(lines),
-        color=0x7B2FBE,
-    )
-    embed.set_footer(text="Use /voidlore view <doc_id> to read content · /voidlore delete <doc_id> to remove")
+    embed = make_embed(f"◈ VOID LORE — {len(docs)} doc(s)", "\n".join(lines), color=0x7B2FBE)
+    embed.set_footer(text="Use /voidlore view <doc_id> to read · /voidlore delete <doc_id> to remove")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ── /voidlore view ────────────────────────────────────────────────
 @voidlore_group.command(name="view", description="Read the full content of a lore doc")
 @app_commands.describe(doc_id="The slug ID of the doc to view")
 async def voidlore_view_cmd(interaction: discord.Interaction, doc_id: str):
     if not _is_admin(interaction):
         await interaction.response.send_message(
-            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True)
     doc = await void_lore_get(doc_id.lower().strip())
-
     if not doc:
         await interaction.followup.send(
-            embed=make_embed("▲ NOT FOUND", f"No lore doc with ID `{doc_id}`.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ NOT FOUND", f"No lore doc with ID `{doc_id}`.", color=0xE63946), ephemeral=True)
         return
-
     content = doc.get("content", "")
-    # Discord embed limit: 4096 chars
     preview = content[:3900] + ("\n\n*...truncated*" if len(content) > 3900 else "")
-
-    embed = make_embed(
-        f"◈ {doc.get('title', doc_id)}",
-        preview,
-        color=0x7B2FBE,
-    )
+    embed = make_embed(f"◈ {doc.get('title', doc_id)}", preview, color=0x7B2FBE)
     embed.set_footer(text=f"doc_id: {doc_id} · {len(content):,} chars total")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ── /voidlore delete ──────────────────────────────────────────────
 @voidlore_group.command(name="delete", description="Delete a lore doc from MongoDB")
 @app_commands.describe(doc_id="The slug ID of the doc to delete")
 async def voidlore_delete_cmd(interaction: discord.Interaction, doc_id: str):
     if not _is_admin(interaction):
         await interaction.response.send_message(
-            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True)
     deleted = await void_lore_delete(doc_id.lower().strip())
-
     if deleted:
         await interaction.followup.send(
-            embed=make_embed("◈ VOID LORE DELETED", f"`{doc_id}` has been removed from MongoDB.", color=0x10B981),
-            ephemeral=True,
-        )
+            embed=make_embed("◈ VOID LORE DELETED", f"`{doc_id}` removed from MongoDB.", color=0x10B981), ephemeral=True)
     else:
         await interaction.followup.send(
-            embed=make_embed("▲ NOT FOUND", f"No doc with ID `{doc_id}` — nothing deleted.", color=0xE63946),
-            ephemeral=True,
-        )
+            embed=make_embed("▲ NOT FOUND", f"No doc with ID `{doc_id}` — nothing deleted.", color=0xE63946), ephemeral=True)
 
 
 bot.run(TOKEN)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /shadowcard — Admin uploads a Shadow Card image
+#  Card stored in MongoDB and displayed in shadowcard channel
+#  Syncs shadowCardImage to Shadow Records via GAS
+# ══════════════════════════════════════════════════════════════════
+
+async def _save_shadowcard_db(shadow_id: str, image_url: str, uploader_id: str):
+    db = get_db()
+    if db is not None:
+        await db["shadowcards"].update_one(
+            {"_id": shadow_id},
+            {"$set": {
+                "shadow_id":   shadow_id,
+                "image_url":   image_url,
+                "uploaded_by": uploader_id,
+                "uploaded_at": datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
+            }},
+            upsert=True,
+        )
+
+async def _get_shadowcard_db(shadow_id: str):
+    db = get_db()
+    if db is not None:
+        return await db["shadowcards"].find_one({"_id": shadow_id})
+    return None
+
+async def _push_shadowcard_to_gas(shadow_id: str, image_url: str):
+    try:
+        payload = json.dumps({"action": "updateShadowCard", "shadowId": shadow_id, "shadowCardImage": image_url})
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(GAS_URL, data=payload, headers={"Content-Type": "text/plain"},
+                                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                print(f"[SHADOWCARD] GAS push status={resp.status} sid={shadow_id}")
+    except Exception as e:
+        print(f"[SHADOWCARD] GAS push error: {e}")
+
+
+@tree.command(name="shadowcard", description="[HIGH CLEARANCE] Upload a Shadow Card image for an operative")
+@app_commands.describe(
+    user="The operative to assign this card to",
+    image="Upload the Shadow Card image directly",
+    image_url="Or paste a direct image URL instead of uploading",
+)
+async def shadowcard_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    image: discord.Attachment = None,
+    image_url: str = None,
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    if not image and not image_url:
+        await interaction.response.send_message(
+            embed=make_embed("▲ IMAGE REQUIRED", "Provide an image upload **or** a direct image URL.", color=0xE63946),
+            ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    data      = await load_data()
+    uid       = str(user.id)
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT LINKED", f"**{user.display_name}** has no linked Shadow ID.", color=0xE63946))
+        return
+
+    final_url = image.url if image else image_url.strip()
+
+    # Save to MongoDB
+    await _save_shadowcard_db(shadow_id, final_url, str(interaction.user.id))
+
+    # Update member record for GAS/website
+    for i, m in enumerate(data["members"]):
+        if m["shadowId"] == shadow_id:
+            data["members"][i]["shadowCardImage"] = final_url
+            break
+    await save_data(data)
+    asyncio.create_task(_push_shadowcard_to_gas(shadow_id, final_url))
+
+    member_obj = get_member(shadow_id, data)
+    codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
+
+    card_embed = discord.Embed(
+        title=f"🃏 SHADOW CARD — {codename}",
+        description=f"**Shadow ID:** `{shadow_id}`\n**Operative:** {user.mention}\n\n*Now live on Shadow Records.*",
+        color=0x7B2FBE,
+    )
+    card_embed.set_image(url=final_url)
+    card_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · Uploaded by {interaction.user.display_name}")
+
+    sc_ch = discord.utils.get(interaction.guild.text_channels, name=SHADOWCARD_CHANNEL)
+    if sc_ch and sc_ch.id != interaction.channel_id:
+        await sc_ch.send(embed=card_embed)
+        await interaction.followup.send(
+            embed=make_embed("🃏 SHADOW CARD UPLOADED",
+                f"`{shadow_id}` — **{codename}**\nPosted in {sc_ch.mention} and synced to Shadow Records.",
+                color=0x10B981))
+    else:
+        await interaction.followup.send(embed=card_embed)
+
+
+@tree.command(name="viewshadowcard", description="View the Shadow Card for an operative")
+@app_commands.describe(user="The operative whose card you want to view (leave blank for your own)")
+async def viewshadowcard_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer()
+    target    = user or interaction.user
+    data      = await load_data()
+    uid       = str(target.id)
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT LINKED", f"**{target.display_name}** has no linked Shadow ID.", color=0xE63946))
+        return
+    card = await _get_shadowcard_db(shadow_id)
+    if not card:
+        await interaction.followup.send(embed=make_embed(
+            "◈ NO SHADOW CARD",
+            f"No Shadow Card set yet for `{shadow_id}`.\nAdmins can upload one with `/shadowcard @{target.display_name}`.",
+            color=0x6B6B9A))
+        return
+    member_obj = get_member(shadow_id, data)
+    codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
+    embed = discord.Embed(title=f"🃏 SHADOW CARD — {codename}", description=f"**Shadow ID:** `{shadow_id}`", color=0x7B2FBE)
+    embed.set_image(url=card["image_url"])
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · Shadow Records")
+    await interaction.followup.send(embed=embed)
+
