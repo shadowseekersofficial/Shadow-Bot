@@ -1941,6 +1941,7 @@ async def todo_add(interaction: discord.Interaction, task: str):
 @todo_group.command(name="done", description="Mark objectives as fulfilled — single or comma-separated e.g. 1,3,5")
 @app_commands.describe(numbers="Objective number(s), comma-separated e.g. 1,3,5")
 async def todo_done(interaction: discord.Interaction, numbers: str):
+    await interaction.response.defer()
     data   = await load_data()
     uid    = str(interaction.user.id)
     active = get_active_date(uid, data)
@@ -1949,14 +1950,14 @@ async def todo_done(interaction: discord.Interaction, numbers: str):
     try:
         indices = sorted(set(int(n.strip()) for n in numbers.split(",") if n.strip()))
     except ValueError:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ INVALID INPUT", "Provide number(s) separated by commas e.g. `1,3,5`.", color=0xE63946)
         )
         return
 
     invalid = [n for n in indices if n < 1 or n > len(todos)]
     if not todos or invalid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective(s) {', '.join(f'#{n}' for n in invalid)} don't exist. Check `/todo list`.", color=0xE63946),
         )
         return
@@ -1989,7 +1990,7 @@ async def todo_done(interaction: discord.Interaction, numbers: str):
     task_lines = "\n".join(f"*{task}*" for task in completed)
     title = "☽ OBJECTIVE FULFILLED" if len(completed) == 1 else f"☽ {len(completed)} OBJECTIVES FULFILLED"
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=make_embed(
             title,
             f"**{interaction.user.display_name}** completed:{date_note}\n{task_lines}\n\n"
@@ -2070,6 +2071,7 @@ async def todo_list(interaction: discord.Interaction):
 
 @todo_group.command(name="clear", description="Purge your active date's dossier")
 async def todo_clear(interaction: discord.Interaction):
+    await interaction.response.defer()
     data   = await load_data()
     uid    = str(interaction.user.id)
     active = get_active_date(uid, data)
@@ -2079,7 +2081,7 @@ async def todo_clear(interaction: discord.Interaction):
     is_today  = active == today_str()
     date_note = "today's" if is_today else f"{active}'s"
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=make_embed("◈ OBJECTIVES CLEARED", f"**{interaction.user.display_name}** {date_note} dossier cleared. Fresh start.", color=0x6B6B9A)
     )
 
@@ -2703,6 +2705,7 @@ tree.add_command(exam_group)
 # ── /exams — server-wide exam countdown ──────────────────────────
 @tree.command(name="exams", description="View all upcoming exams across the server")
 async def exams_server(interaction: discord.Interaction):
+    await interaction.response.defer()
     data = await load_data()
 
     all_exams = []  # (exam_dict, discord_member)
@@ -2713,7 +2716,7 @@ async def exams_server(interaction: discord.Interaction):
             all_exams.append((exam, name))
 
     if not all_exams:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed(
                 "📅 NO EXAMS",
                 "No exams added yet. Members can add their exams with `/exam add`.",
@@ -2750,7 +2753,7 @@ async def exams_server(interaction: discord.Interaction):
         color=0xF0A500
     )
     embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · {len(sorted_all)} total exams tracked")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 # ── /echoes ───────────────────────────────────────────────────────
 @tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
