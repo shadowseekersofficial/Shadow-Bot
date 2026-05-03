@@ -42,14 +42,25 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 # ── MONGO ─────────────────────────────────────────────────────────
 _mongo_client = None
-_db           = None
+_db_bot       = None   # shadowbot    — members, exams, todos
+_db_void      = None   # shadowseekers — void_chats
 
 def get_db():
-    global _mongo_client, _db
-    if _db is None and MONGO_URI:
+    """shadowbot — operative data written by bot."""
+    global _mongo_client, _db_bot
+    if _db_bot is None and MONGO_URI:
         _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-        _db = _mongo_client["shadowseekers"]
-    return _db
+        _db_bot = _mongo_client["shadowbot"]
+    return _db_bot
+
+def get_void_db():
+    """shadowseekers — void chat state."""
+    global _mongo_client, _db_void
+    if _db_void is None and MONGO_URI:
+        if _mongo_client is None:
+            _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+        _db_void = _mongo_client["shadowseekers"]
+    return _db_void
 
 # ── FASTAPI ───────────────────────────────────────────────────────
 app = FastAPI(title="Void Server", docs_url=None, redoc_url=None)
@@ -179,7 +190,7 @@ async def gas_verify_login(shadow_id: str, passphrase: str) -> bool:
 
 async def mongo_get_void_state(shadow_id: str) -> dict:
     """Get rolling 20 messages + memory snapshot from MongoDB."""
-    db = get_db()
+    db = get_void_db()
     if db is None:
         return {"messages": [], "snapshot": ""}
     try:
@@ -196,7 +207,7 @@ async def mongo_get_void_state(shadow_id: str) -> dict:
 
 async def mongo_save_void_state(shadow_id: str, messages: list, snapshot: str):
     """Save rolling 20 + snapshot to MongoDB."""
-    db = get_db()
+    db = get_void_db()
     if db is None:
         return
     try:
@@ -217,7 +228,7 @@ async def mongo_save_void_state(shadow_id: str, messages: list, snapshot: str):
 
 async def mongo_clear_void_state(shadow_id: str):
     """Clear conversation for this operative."""
-    db = get_db()
+    db = get_void_db()
     if db is None:
         return
     try:
@@ -240,15 +251,13 @@ async def mongo_get_operative_profile(shadow_id: str) -> dict | None:
     if db is None:
         return None
     try:
-        # Try members collection (how bot stores it)
-        doc = await db["members"].find_one({"shadowId": shadow_id})
+        # Members stored as array inside _id:"list" document
+        doc = await db["members"].find_one({"_id": "list"})
         if doc:
-            return doc
-
-        # Fallback: links collection
-        link = await db["links"].find_one({"shadow_id": shadow_id, "approved": True})
-        if link:
-            return {"shadowId": shadow_id, "codename": link.get("codename", shadow_id)}
+            members = doc.get("members", [])
+            for m in members:
+                if m.get("shadowId") == shadow_id:
+                    return m
     except Exception as e:
         print(f"[VOID SERVER] Profile fetch failed {shadow_id}: {e}")
     return None
@@ -304,26 +313,21 @@ async def mongo_find_discord_uid(shadow_id: str) -> str | None:
 
 
 async def mongo_find_best_peer(topic: str, exclude_shadow_id: str) -> dict | None:
-    """
-    Find the best operative across ALL ShadowSeekers for a given topic.
-    Searches entire members collection — highest echoes as strength proxy.
-    Returns {shadowId, codename, archetype} or None.
-    """
+    """Find best operative across ALL ShadowSeekers for a given topic."""
     db = get_db()
     if db is None:
         return None
     try:
-        cursor = db["members"].find(
-            {"shadowId": {"$ne": exclude_shadow_id}},
-            {"shadowId": 1, "codename": 1, "archetype": 1, "echoCount": 1, "strengths": 1}
-        ).sort("echoCount", -1).limit(50)
-        all_members = await cursor.to_list(length=50)
-
+        doc = await db["members"].find_one({"_id": "list"})
+        if not doc:
+            return None
+        all_members = [
+            m for m in doc.get("members", [])
+            if m.get("shadowId") != exclude_shadow_id
+        ]
         if not all_members:
             return None
-
         topic_lower = topic.lower()
-
         # 1. Match by explicit strengths field
         for m in all_members:
             strengths = m.get("strengths", [])
@@ -335,15 +339,13 @@ async def mongo_find_best_peer(topic: str, exclude_shadow_id: str) -> dict | Non
                             "codename":  m.get("codename", m["shadowId"]),
                             "archetype": m.get("archetype", "Unknown"),
                         }
-
-        # 2. Fallback — highest echo count (most battle-hardened operative)
-        best = all_members[0]
+        # 2. Fallback - highest echo count
+        best = sorted(all_members, key=lambda x: int(x.get("echoCount", 0) or 0), reverse=True)[0]
         return {
             "shadowId":  best["shadowId"],
             "codename":  best.get("codename", best["shadowId"]),
             "archetype": best.get("archetype", "Unknown"),
         }
-
     except Exception as e:
         print(f"[VOID SERVER] Peer routing failed: {e}")
     return None
@@ -683,7 +685,7 @@ async def void_newchat(req: NewChatRequest):
 # ── STARTUP ───────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    db = get_db()
+    db = get_void_db()
     if db is not None:
         try:
             # TTL index — auto-expire void_chats after 90 days of inactivity
