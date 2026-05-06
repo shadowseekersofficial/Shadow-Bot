@@ -905,6 +905,154 @@ async def void_newchat(req: NewChatRequest):
     return {"status": "cleared", "shadow_id": sid}
 
 
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SHADOWCARD CONFIG ROUTES
+#  Collection: shadowbot["shadowcard_configs"]
+#  GET  /shadowcard/configs          — all 5 card configs
+#  GET  /shadowcard/config/{type}    — single card config
+#  POST /shadowcard/config           — save config (admin only)
+# ══════════════════════════════════════════════════════════════════
+
+SHADOWCARD_ADMIN_SECRET = os.getenv("SHADOWCARD_ADMIN_SECRET", "change-me")
+SHADOWCARD_TYPES = ["draven", "nyx", "kairo", "lyra", "astra"]
+
+_SHADOWCARD_DEFAULTS = {
+    "draven": {
+        "archetypeName": "DRAVEN", "tagline": "Built different. Still here.",
+        "archetypeFont": "'Cinzel Decorative', serif", "taglineFont": "'IM Fell English', serif", "nameFont": "'Cinzel', serif",
+        "archetypeFontSize": 42, "taglineFontSize": 16, "nameFontSize": 18, "subFontSize": 13,
+        "archetypeColor": "#f0d080", "taglineColor": "#d4b870", "nameColor": "#ffffff",
+        "subColor": "#c9a84c", "ornamentColor": "#a07838",
+        "ringColor": "#c9a84c", "ringThickness": 4, "ringGlow": 10,
+        "archetypeGlow": 18, "taglineGlow": 8,
+        "textX": 62, "textY": 38, "textAlign": "center", "lineSpacing": 10,
+        "pfpX": 15, "pfpY": 42, "pfpSize": 180,
+        "qrX": 5, "qrY": 80, "qrSize": 70,
+        "showOrnament": True, "ornamentChar": "⸻ ✦ ⸻",
+        "bgImageUrl": "", "qrImageUrl": "",
+    },
+    "nyx": {
+        "archetypeName": "NYX", "tagline": "Child of the Night",
+        "archetypeFont": "'Cinzel Decorative', serif", "taglineFont": "'IM Fell English', serif", "nameFont": "'Cinzel', serif",
+        "archetypeFontSize": 42, "taglineFontSize": 16, "nameFontSize": 18, "subFontSize": 13,
+        "archetypeColor": "#f0d080", "taglineColor": "#d4b870", "nameColor": "#ffffff",
+        "subColor": "#c9a84c", "ornamentColor": "#a07838",
+        "ringColor": "#c9a84c", "ringThickness": 4, "ringGlow": 10,
+        "archetypeGlow": 18, "taglineGlow": 8,
+        "textX": 62, "textY": 38, "textAlign": "center", "lineSpacing": 10,
+        "pfpX": 22, "pfpY": 45, "pfpSize": 180,
+        "qrX": 5, "qrY": 80, "qrSize": 70,
+        "showOrnament": True, "ornamentChar": "⸻ ✦ ⸻",
+        "bgImageUrl": "", "qrImageUrl": "",
+    },
+    "kairo": {
+        "archetypeName": "KAIRO", "tagline": "Logic is the only weapon.",
+        "archetypeFont": "'Cinzel', serif", "taglineFont": "'Spectral', serif", "nameFont": "'Cinzel', serif",
+        "archetypeFontSize": 42, "taglineFontSize": 16, "nameFontSize": 18, "subFontSize": 13,
+        "archetypeColor": "#a0d0ff", "taglineColor": "#80b8e8", "nameColor": "#ffffff",
+        "subColor": "#7abaff", "ornamentColor": "#507090",
+        "ringColor": "#7abaff", "ringThickness": 4, "ringGlow": 10,
+        "archetypeGlow": 18, "taglineGlow": 8,
+        "textX": 62, "textY": 38, "textAlign": "center", "lineSpacing": 10,
+        "pfpX": 22, "pfpY": 45, "pfpSize": 180,
+        "qrX": 5, "qrY": 80, "qrSize": 70,
+        "showOrnament": True, "ornamentChar": "── ◈ ──",
+        "bgImageUrl": "", "qrImageUrl": "",
+    },
+    "lyra": {
+        "archetypeName": "LYRA", "tagline": "Harmony through chaos.",
+        "archetypeFont": "'IM Fell English', serif", "taglineFont": "'Cormorant Garamond', serif", "nameFont": "'Cinzel', serif",
+        "archetypeFontSize": 42, "taglineFontSize": 16, "nameFontSize": 18, "subFontSize": 13,
+        "archetypeColor": "#ffb0d0", "taglineColor": "#e890b0", "nameColor": "#ffffff",
+        "subColor": "#ff8ab0", "ornamentColor": "#904060",
+        "ringColor": "#ff8ab0", "ringThickness": 4, "ringGlow": 10,
+        "archetypeGlow": 18, "taglineGlow": 8,
+        "textX": 62, "textY": 38, "textAlign": "center", "lineSpacing": 10,
+        "pfpX": 22, "pfpY": 45, "pfpSize": 180,
+        "qrX": 5, "qrY": 80, "qrSize": 70,
+        "showOrnament": True, "ornamentChar": "~ ✦ ~",
+        "bgImageUrl": "", "qrImageUrl": "",
+    },
+    "astra": {
+        "archetypeName": "ASTRA", "tagline": "Beyond the horizon.",
+        "archetypeFont": "'Uncial Antiqua', cursive", "taglineFont": "'IM Fell English', serif", "nameFont": "'Cinzel', serif",
+        "archetypeFontSize": 42, "taglineFontSize": 16, "nameFontSize": 18, "subFontSize": 13,
+        "archetypeColor": "#d0a0ff", "taglineColor": "#b880f0", "nameColor": "#ffffff",
+        "subColor": "#c080ff", "ornamentColor": "#704090",
+        "ringColor": "#c080ff", "ringThickness": 4, "ringGlow": 10,
+        "archetypeGlow": 18, "taglineGlow": 8,
+        "textX": 62, "textY": 38, "textAlign": "center", "lineSpacing": 10,
+        "pfpX": 22, "pfpY": 45, "pfpSize": 180,
+        "qrX": 5, "qrY": 80, "qrSize": 70,
+        "showOrnament": True, "ornamentChar": "✦ ✧ ✦",
+        "bgImageUrl": "", "qrImageUrl": "",
+    },
+}
+
+
+async def sc_get_config(card_type: str) -> dict:
+    db = get_db()
+    if db is not None:
+        try:
+            doc = await db["shadowcard_configs"].find_one({"_id": card_type})
+            if doc:
+                doc.pop("_id", None)
+                return {**_SHADOWCARD_DEFAULTS.get(card_type, {}), **doc}
+        except Exception as e:
+            print(f"[SHADOWCARD] Mongo get failed {card_type}: {e}")
+    return dict(_SHADOWCARD_DEFAULTS.get(card_type, {}))
+
+
+async def sc_save_config(card_type: str, config: dict):
+    db = get_db()
+    if db is not None:
+        try:
+            await db["shadowcard_configs"].update_one(
+                {"_id": card_type},
+                {"$set": {"_id": card_type, **config}},
+                upsert=True,
+            )
+        except Exception as e:
+            print(f"[SHADOWCARD] Mongo save failed {card_type}: {e}")
+
+
+class ShadowCardConfigRequest(BaseModel):
+    cardType: str
+    config: dict
+    adminSecret: str
+
+
+@app.get("/shadowcard/configs")
+async def get_all_shadowcard_configs():
+    """Fetch configs for all 5 card types at once."""
+    result = {}
+    for ct in SHADOWCARD_TYPES:
+        result[ct] = await sc_get_config(ct)
+    return result
+
+
+@app.get("/shadowcard/config/{card_type}")
+async def get_shadowcard_config(card_type: str):
+    """Fetch config for a single card type."""
+    ct = card_type.lower()
+    if ct not in SHADOWCARD_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid card type. Use: {', '.join(SHADOWCARD_TYPES)}")
+    return {"cardType": ct, "config": await sc_get_config(ct)}
+
+
+@app.post("/shadowcard/config")
+async def save_shadowcard_config(req: ShadowCardConfigRequest):
+    """Save config for a card type. Requires admin secret."""
+    if req.adminSecret != SHADOWCARD_ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized — invalid admin secret")
+    ct = req.cardType.lower()
+    if ct not in SHADOWCARD_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid card type. Use: {', '.join(SHADOWCARD_TYPES)}")
+    await sc_save_config(ct, req.config)
+    return {"ok": True, "cardType": ct}
+
 # ── STARTUP ───────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
